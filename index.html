@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>卷烟订货测算工具</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">本地单机版 MVP</p>
+        <h1>卷烟订货测算工具</h1>
+        <p class="hero-copy">
+          导入价格表和订单表，配置档位规则，自动完成满档测算、最优订货组合和订单盈亏分析。
+        </p>
+      </div>
+      <div class="hero-card">
+        <div class="hero-stat">
+          <span>适用场景</span>
+          <strong>档位测评 / 找货利润 / 订单复盘</strong>
+        </div>
+        <div class="hero-stat">
+          <span>当前版本</span>
+          <strong>可直接打开 `index.html` 使用</strong>
+        </div>
+      </div>
+    </header>
+
+    <main class="main-grid">
+      <section class="panel">
+        <h2>1. 导入数据</h2>
+        <div class="upload-grid">
+          <label class="upload-card">
+            <span>基础价格表</span>
+            <input id="priceFile" type="file" accept=".xlsx,.xls,.csv">
+            <small>支持商品、批发价、建议零售价等字段</small>
+          </label>
+          <label class="upload-card">
+            <span>订单明细表</span>
+            <input id="orderFile" type="file" accept=".xlsx,.xls,.csv">
+            <small>支持订单量、金额、需求量等字段</small>
+          </label>
+          <label class="upload-card">
+            <span>行情价格表</span>
+            <input id="marketFile" type="file" accept=".xlsx,.xls,.csv">
+            <small>可选，字段建议含“商品”“行情价”</small>
+          </label>
+        </div>
+        <div class="inline-actions">
+          <button id="loadSampleBtn" type="button">加载当前预置规则</button>
+          <button id="recalcBtn" type="button" class="primary">重新计算</button>
+        </div>
+        <div id="importSummary" class="notice">等待导入文件。</div>
+      </section>
+
+      <section class="panel">
+        <h2>2. 档位规则</h2>
+        <div class="rule-toolbar">
+          <label>
+            规则模板
+            <select id="presetSelect"></select>
+          </label>
+          <label>
+            目标总条数
+            <input id="targetTotal" type="number" min="0" step="1">
+          </label>
+          <label>
+            投放量
+            <input id="supplyTotal" type="number" min="0" step="1">
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table id="bandTable">
+            <thead>
+              <tr>
+                <th>分段</th>
+                <th>零售价区间</th>
+                <th>上限</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>3. 行情价格维护</h2>
+        <div class="inline-actions">
+          <button id="fillRetailBtn" type="button">行情价先填建议零售价</button>
+          <button id="clearMarketBtn" type="button">清空行情价</button>
+        </div>
+        <div class="table-wrap compact-table">
+          <table id="marketTable">
+            <thead>
+              <tr>
+                <th>商品</th>
+                <th>建议零售价</th>
+                <th>批发价</th>
+                <th>可订量</th>
+                <th>行情价</th>
+                <th>单条利润</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>4. 满档测算</h2>
+        <div id="fillSummary" class="metrics-grid"></div>
+        <div class="table-wrap compact-table">
+          <table id="fillTable">
+            <thead>
+              <tr>
+                <th>方案</th>
+                <th>条数</th>
+                <th>金额</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>5. 最优订货组合</h2>
+        <div id="optSummary" class="metrics-grid"></div>
+        <div class="table-wrap compact-table">
+          <table id="optTable">
+            <thead>
+              <tr>
+                <th>商品</th>
+                <th>分段</th>
+                <th>批发价</th>
+                <th>行情价</th>
+                <th>推荐条数</th>
+                <th>预估利润</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>6. 订单盈亏分析</h2>
+        <div id="profitSummary" class="metrics-grid"></div>
+        <div class="table-wrap compact-table">
+          <table id="profitTable">
+            <thead>
+              <tr>
+                <th>商品</th>
+                <th>订单量</th>
+                <th>批发价</th>
+                <th>行情价</th>
+                <th>单条利润</th>
+                <th>订单利润</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="./vendor/xlsx.full.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
