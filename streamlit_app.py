@@ -87,6 +87,9 @@ st.caption("订单、订货量、库存、行情价格都在一个页面里处�
 if "analysis_started" not in st.session_state:
     st.session_state.analysis_started = False
 
+if "last_saved_price_upload_key" not in st.session_state:
+    st.session_state.last_saved_price_upload_key = None
+
 db_prices = load_price_db()
 
 st.subheader("行情价格库")
@@ -106,23 +109,36 @@ with col3:
 with col4:
     price_file = st.file_uploader("上传最新行情价格", type=["xlsx"], key="price_file")
 
-if price_file is not None:
-    uploaded_prices = parse_prices(price_file)
-    db_prices = merge_uploaded_prices(db_prices, uploaded_prices)
-    save_price_db(db_prices)
-    st.success(f"已更新行情价格库，本次写入 {len(uploaded_prices)} 条价格记录。")
+analysis_password = st.text_input("分析密码", type="password", placeholder="请输入开始计算密码")
+password_correct = analysis_password == "523626"
+current_price_upload_key = None if price_file is None else f"{price_file.name}:{price_file.size}"
 
-if st.button("开始计算", type="primary", use_container_width=True):
+if st.button("开始计算", type="primary", use_container_width=True, disabled=not password_correct):
     st.session_state.analysis_started = True
+
+if analysis_password and not password_correct:
+    st.warning("密码不正确，无法开始计算。")
 
 if not strategy_file:
     st.session_state.analysis_started = False
     st.info("请先上传订货量/投放表。订单明细和库存表都可以不传。")
     st.stop()
 
+if not password_correct:
+    st.session_state.analysis_started = False
+    st.info("请输入正确密码后，再点击“开始计算”。")
+    st.stop()
+
 if not st.session_state.analysis_started:
     st.info("文件上传完成后，点击“开始计算”再执行分析。")
     st.stop()
+
+if price_file is not None and current_price_upload_key != st.session_state.last_saved_price_upload_key:
+    uploaded_prices = parse_prices(price_file)
+    db_prices = merge_uploaded_prices(db_prices, uploaded_prices)
+    save_price_db(db_prices)
+    st.session_state.last_saved_price_upload_key = current_price_upload_key
+    st.success(f"已更新行情价格库，本次写入 {len(uploaded_prices)} 条价格记录。")
 
 if db_prices.empty:
     st.error("当前行情价格库为空，无法引用历史批发价，请先上传一份行情价格表初始化价格库。")
@@ -235,26 +251,31 @@ else:
     if not missing_order_market_prices.empty:
         st.markdown("**以下订单商品已自动加入商品库，但还没有行情价格，请补录后保存**")
         order_editable = missing_order_market_prices.copy()
+        order_editable = order_editable[order_editable["商品名称"].astype(str).str.strip().ne("合计")].copy()
         order_editable["当期找货价格"] = order_editable["当期找货价格"].astype("float64")
-        with st.form("missing_order_market_prices_form"):
-            order_edited = st.data_editor(
-                order_editable,
-                use_container_width=True,
-                hide_index=True,
-                key="missing_order_market_prices_editor",
-            )
-            save_order_prices = st.form_submit_button("保存订单缺失行情价格", type="primary")
-        if save_order_prices:
-            manual = order_edited.copy()
-            manual = manual[manual["当期找货价格"].notna()].copy()
-            if manual.empty:
-                st.warning("还没有填写可保存的订单行情价格。")
-            else:
-                manual["批发价"] = pd.to_numeric(manual.get("批发价"), errors="coerce")
-                manual["建议零售价"] = pd.to_numeric(manual.get("建议零售价"), errors="coerce")
-                updated_db = upsert_manual_market_prices(db_prices, manual)
-                save_price_db(updated_db)
-                st.success(f"已把 {len(manual)} 条订单商品行情价格写入价格库。刷新后会按新价格重新计算。")
+        if order_editable.empty:
+            st.info("缺少行情价格的订单商品里只有“合计”行，已自动排除。")
+        else:
+            with st.form("missing_order_market_prices_form"):
+                order_edited = st.data_editor(
+                    order_editable,
+                    use_container_width=True,
+                    hide_index=True,
+                    key="missing_order_market_prices_editor",
+                )
+                save_order_prices = st.form_submit_button("保存订单缺失行情价格", type="primary")
+            if save_order_prices:
+                manual = order_edited.copy()
+                manual = manual[manual["商品名称"].astype(str).str.strip().ne("合计")].copy()
+                manual = manual[manual["当期找货价格"].notna()].copy()
+                if manual.empty:
+                    st.warning("还没有填写可保存的订单行情价格。")
+                else:
+                    manual["批发价"] = pd.to_numeric(manual.get("批发价"), errors="coerce")
+                    manual["建议零售价"] = pd.to_numeric(manual.get("建议零售价"), errors="coerce")
+                    updated_db = upsert_manual_market_prices(db_prices, manual)
+                    save_price_db(updated_db)
+                    st.success(f"已把 {len(manual)} 条订单商品行情价格写入价格库。刷新后会按新价格重新计算。")
 
 st.divider()
 st.subheader("4. 本期档位最高满订汇总")
@@ -404,23 +425,28 @@ else:
     if not missing_market_prices.empty:
         st.markdown("**以下库存商品缺少行情价格，请补录后保存到行情价格库**")
         editable = missing_market_prices.copy()
+        editable = editable[editable["商品名称"].astype(str).str.strip().ne("合计")].copy()
         editable["当期找货价格"] = editable["当期找货价格"].astype("float64")
-        with st.form("missing_market_prices_form"):
-            edited = st.data_editor(
-                editable,
-                use_container_width=True,
-                hide_index=True,
-                key="missing_market_prices_editor",
-            )
-            save_manual_prices = st.form_submit_button("保存补录行情价格", type="primary")
-        if save_manual_prices:
-            manual = edited.copy()
-            manual = manual[manual["当期找货价格"].notna()].copy()
-            if manual.empty:
-                st.warning("还没有填写可保存的行情价格。")
-            else:
-                manual["批发价"] = pd.to_numeric(manual.get("批发价"), errors="coerce")
-                manual["建议零售价"] = pd.to_numeric(manual.get("建议零售价"), errors="coerce")
-                updated_db = upsert_manual_market_prices(db_prices, manual)
-                save_price_db(updated_db)
-                st.success(f"已把 {len(manual)} 条补录行情写入价格库。刷新后会按新价格重新计算库存估值。")
+        if editable.empty:
+            st.info("缺少行情价格的库存商品里只有“合计”行，已自动排除。")
+        else:
+            with st.form("missing_market_prices_form"):
+                edited = st.data_editor(
+                    editable,
+                    use_container_width=True,
+                    hide_index=True,
+                    key="missing_market_prices_editor",
+                )
+                save_manual_prices = st.form_submit_button("保存补录行情价格", type="primary")
+            if save_manual_prices:
+                manual = edited.copy()
+                manual = manual[manual["商品名称"].astype(str).str.strip().ne("合计")].copy()
+                manual = manual[manual["当期找货价格"].notna()].copy()
+                if manual.empty:
+                    st.warning("还没有填写可保存的行情价格。")
+                else:
+                    manual["批发价"] = pd.to_numeric(manual.get("批发价"), errors="coerce")
+                    manual["建议零售价"] = pd.to_numeric(manual.get("建议零售价"), errors="coerce")
+                    updated_db = upsert_manual_market_prices(db_prices, manual)
+                    save_price_db(updated_db)
+                    st.success(f"已把 {len(manual)} 条补录行情写入价格库。刷新后会按新价格重新计算库存估值。")
