@@ -1,2 +1,5 @@
-"""卷烟订货测算工具核心模块。"""
+﻿"""规则说明版卷烟工具。"""
 
+from .rules import RULE_MODULES, RuleFormula, RuleModule
+
+__all__ = ["RULE_MODULES", "RuleFormula", "RuleModule"]

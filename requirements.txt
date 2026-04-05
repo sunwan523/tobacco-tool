@@ -1,5 +1,4 @@
 streamlit
 pandas
-pillow
-pypinyin
 openpyxl
+pypinyin
