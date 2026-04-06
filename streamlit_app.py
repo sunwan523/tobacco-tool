@@ -28,7 +28,7 @@ from tobacco_core.analysis import (
 from tobacco_core.price_store import load_price_db, merge_order_products, merge_uploaded_prices, save_price_db, search_prices, upsert_manual_market_prices
 
 
-st.set_page_config(page_title="卷烟订单分析工具", layout="centered")
+st.set_page_config(page_title="梦回唐朝卷烟助手", layout="centered")
 
 st.markdown(
     """
@@ -64,12 +64,13 @@ def integer(value: int | float) -> str:
 
 def format_price_library(data: pd.DataFrame) -> pd.io.formats.style.Styler:
     ordered = data.copy()
-    columns = [col for col in ["商品名称", "当期找货价格", "批发价", "建议零售价", "盒码", "条码"] if col in ordered.columns]
+    columns = [col for col in ["商品名称", "当期找货价格", "批发价", "建议零售价"] if col in ordered.columns]
     ordered = ordered[columns]
     styler = ordered.style
     if "当期找货价格" in ordered.columns:
         styler = styler.format({"当期找货价格": "{:,.2f}", "批发价": "{:,.2f}", "建议零售价": "{:,.2f}"}, na_rep="")
         styler = styler.set_properties(subset=["当期找货价格"], **{"font-weight": "700"})
+    styler = styler.set_properties(**{"font-size": "0.9rem", "padding": "0.25rem 0.4rem"})
     return styler
 
 
@@ -81,7 +82,7 @@ def signed_diff_html(value: float, is_money: bool = False) -> str:
     return f"<div style='text-align:center;color:{color};font-weight:{weight};font-size:1.15rem'>{display}</div>"
 
 
-st.title("卷烟订单分析工具")
+st.title("梦回唐朝卷烟助手")
 st.caption("订单、订货量、库存、行情价格都在一个页面里处理。订单分析结果同页展示；行情价格保存为本地价格库，新的找货价格会覆盖旧值。没上传行情表时，默认直接使用本地价格库。")
 
 if "analysis_started" not in st.session_state:
@@ -92,9 +93,26 @@ if "last_saved_price_upload_key" not in st.session_state:
 
 db_prices = load_price_db()
 
-st.subheader("行情价格库")
-search_text = st.text_input("价格查询", placeholder="支持商品名、商品名拼音首字母、条码、盒码，条码/盒码输入超过 4 位可模糊检索")
-price_results = search_prices(db_prices, search_text)
+st.subheader("曲靖本地近期行情价格查询")
+if "price_search_text" not in st.session_state:
+    st.session_state.price_search_text = ""
+
+with st.form("price_search_form", clear_on_submit=False):
+    search_col, button_col = st.columns([4, 1], gap="small")
+    with search_col:
+        search_text = st.text_input(
+            "价格查询",
+            value=st.session_state.price_search_text,
+            placeholder="输入商品名、拼音首字母、条码或盒码",
+            label_visibility="collapsed",
+        )
+    with button_col:
+        submitted = st.form_submit_button("查询", use_container_width=True)
+
+if submitted:
+    st.session_state.price_search_text = search_text.strip()
+
+price_results = search_prices(db_prices, st.session_state.price_search_text)
 st.dataframe(format_price_library(price_results), use_container_width=True, hide_index=True)
 
 st.divider()
