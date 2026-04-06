@@ -28,7 +28,7 @@ from tobacco_core.analysis import (
 from tobacco_core.price_store import load_price_db, merge_order_products, merge_uploaded_prices, save_price_db, search_prices, upsert_manual_market_prices
 
 
-st.set_page_config(page_title="梦回唐朝卷烟助手", layout="centered")
+st.set_page_config(page_title="梦回唐朝图文店", layout="centered")
 
 st.markdown(
     """
@@ -87,7 +87,7 @@ def signed_diff_html(value: float, is_money: bool = False) -> str:
     return f"<div style='text-align:center;color:{color};font-weight:{weight};font-size:1.15rem'>{display}</div>"
 
 
-st.title("梦回唐朝卷烟助手")
+st.title("梦回唐朝图文店")
 
 if "analysis_started" not in st.session_state:
     st.session_state.analysis_started = False
