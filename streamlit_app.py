@@ -38,6 +38,11 @@ st.markdown(
         padding-top: 2rem;
         padding-bottom: 2rem;
     }
+    h1 {
+        font-size: 1.65rem;
+        line-height: 1.2;
+        margin-bottom: 0.5rem;
+    }
     .stDataFrame, .stButton, .stFileUploader, .stTextInput, .stAlert {
         margin-left: auto;
         margin-right: auto;
@@ -83,7 +88,6 @@ def signed_diff_html(value: float, is_money: bool = False) -> str:
 
 
 st.title("梦回唐朝卷烟助手")
-st.caption("订单、订货量、库存、行情价格都在一个页面里处理。订单分析结果同页展示；行情价格保存为本地价格库，新的找货价格会覆盖旧值。没上传行情表时，默认直接使用本地价格库。")
 
 if "analysis_started" not in st.session_state:
     st.session_state.analysis_started = False
