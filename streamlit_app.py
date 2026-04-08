@@ -67,17 +67,6 @@ def integer(value: int | float) -> str:
     return f"{int(value):,}"
 
 
-def format_price_library(data: pd.DataFrame) -> pd.io.formats.style.Styler:
-    ordered = data.copy()
-    columns = [col for col in ["商品名称", "当期找货价格", "批发价", "建议零售价"] if col in ordered.columns]
-    ordered = ordered[columns]
-    styler = ordered.style
-    if "当期找货价格" in ordered.columns:
-        styler = styler.format({"当期找货价格": "{:,.2f}", "批发价": "{:,.2f}", "建议零售价": "{:,.2f}"}, na_rep="")
-        styler = styler.set_properties(subset=["当期找货价格"], **{"font-weight": "700"})
-    styler = styler.set_properties(**{"font-size": "0.9rem", "padding": "0.25rem 0.4rem"})
-    return styler
-
 
 def signed_diff_html(value: float, is_money: bool = False) -> str:
     negative = value < 0
@@ -100,6 +89,10 @@ db_prices = load_price_db()
 st.subheader("曲靖本地近期行情价格查询")
 if "price_search_text" not in st.session_state:
     st.session_state.price_search_text = ""
+if "price_edits" not in st.session_state:
+    st.session_state.price_edits = {}
+if "show_price_table" not in st.session_state:
+    st.session_state.show_price_table = False
 
 with st.form("price_search_form", clear_on_submit=False):
     search_col, button_col = st.columns([4, 1], gap="small")
@@ -111,13 +104,70 @@ with st.form("price_search_form", clear_on_submit=False):
             label_visibility="collapsed",
         )
     with button_col:
-        submitted = st.form_submit_button("查询", use_container_width=True)
+        submitted = st.form_submit_button("查询", width='stretch')
 
 if submitted:
     st.session_state.price_search_text = search_text.strip()
+    st.session_state.price_edits = {}
+    st.session_state.show_price_table = True
 
 price_results = search_prices(db_prices, st.session_state.price_search_text)
-st.dataframe(format_price_library(price_results), use_container_width=True, hide_index=True)
+
+# 显示可编辑的价格表格
+if st.session_state.show_price_table and not price_results.empty:
+    # 调整列顺序，将当期找货价格列放到商品名称后面，隐藏盒码和条码
+    columns = ["商品名称", "当期找货价格", "建议零售价", "批发价"]
+    price_results = price_results[columns]
+    
+    edited_df = st.data_editor(
+        price_results,
+        column_config={
+            "当期找货价格": st.column_config.NumberColumn(
+                "行情价",
+                min_value=0,
+                step=0.01,
+                format="%.2f",
+                help="可编辑的行情价格"
+            )
+        },
+        disabled=["商品名称", "建议零售价", "批发价"],
+        hide_index=True,
+        width='stretch'
+    )
+    
+    # 检查是否有修改
+    if not edited_df.equals(price_results):
+        # 收集修改的价格
+        price_edits = {}
+        for idx, row in edited_df.iterrows():
+            original_price = price_results.at[idx, "当期找货价格"]
+            new_price = row["当期找货价格"]
+            if original_price != new_price:
+                # 使用商品名称作为键，因为它是唯一的
+                key = row["商品名称"]
+                price_edits[key] = new_price
+        st.session_state.price_edits = price_edits
+        
+        # 添加密码输入和保存按钮
+        if st.session_state.price_edits:
+            st.write("\n")
+            password = st.text_input("请输入密码以保存价格修改", type="password")
+            if st.button("保存价格修改"):
+                if password == "523626":
+                    # 更新价格数据库
+                    updated_prices = db_prices.copy()
+                    for product_name, new_price in st.session_state.price_edits.items():
+                        updated_prices.loc[updated_prices["商品名称"] == product_name, "当期找货价格"] = new_price
+                    save_price_db(updated_prices)
+                    st.success("价格修改已成功保存！")
+                    # 重新加载价格数据
+                    db_prices = load_price_db()
+                    # 清空编辑状态
+                    st.session_state.price_edits = {}
+                else:
+                    st.error("密码错误，请重新输入！")
+elif st.session_state.show_price_table:
+    st.dataframe(price_results, width='stretch', hide_index=True)
 
 st.divider()
 st.subheader("1. 上传分析文件")
