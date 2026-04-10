@@ -387,16 +387,59 @@ if TIER_COLUMNS.index(selected_high) >= TIER_COLUMNS.index(selected_low):
     st.warning("高档位必须比低档位更高。")
 else:
     tier_diff = compute_tier_diff(analysis_data, selected_high, selected_low)
-    diff_cols = st.columns(4)
-    diff_cols[0].metric("新增品种数", integer(len(tier_diff)))
-    diff_cols[1].metric("新增总条数", integer(int(tier_diff["新增量"].sum()) if not tier_diff.empty else 0))
-    diff_cols[2].metric("新增总成本", money(float(tier_diff["新增成本"].sum()) if not tier_diff.empty else 0))
-    diff_cols[3].metric("新增总盈亏", money(float(tier_diff["新增盈亏"].sum()) if not tier_diff.empty else 0))
-    st.dataframe(
-        tier_diff[["价位段", "商品名称", "低档位可订量", "高档位可订量", "新增量", "批发价", "新增成本", "新增盈亏"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    
+    # 展示各段位上限对比
+    st.markdown(f"**{selected_high} 与 {selected_low} 各段位上限对比**")
+    
+    # 添加调试信息
+    st.write("调试信息 - segment_limits内容：")
+    st.dataframe(parsed.segment_limits, use_container_width=True, hide_index=True)
+    
+    # 从segment_limits中获取各段位上限
+    if not parsed.segment_limits.empty and selected_high in parsed.segment_limits.columns and selected_low in parsed.segment_limits.columns:
+        # 获取两个档位的段位上限数据
+        segment_limits_comparison = parsed.segment_limits[["价位段", selected_high, selected_low]].copy()
+        
+        # 确保数值列是数值类型
+        for col in [selected_high, selected_low]:
+            segment_limits_comparison[col] = pd.to_numeric(segment_limits_comparison[col], errors='coerce').fillna(0)
+        
+        segment_limits_comparison = segment_limits_comparison.rename(
+            columns={selected_high: f"{selected_high}上限", selected_low: f"{selected_low}上限"}
+        )
+        
+        # 计算差值
+        segment_limits_comparison[f"上限差值({selected_high}-{selected_low})"] = (
+            segment_limits_comparison[f"{selected_high}上限"] - segment_limits_comparison[f"{selected_low}上限"]
+        )
+        
+        # 只显示有差异的行
+        segment_limits_comparison = segment_limits_comparison[
+            segment_limits_comparison[f"上限差值({selected_high}-{selected_low})"] != 0
+        ]
+        
+        st.dataframe(segment_limits_comparison, use_container_width=True, hide_index=True)
+    else:
+        st.info("无法获取段位上限数据进行对比。")
+        st.write("调试信息：")
+        st.write(f"segment_limits是否为空：{parsed.segment_limits.empty}")
+        st.write(f"selected_high列是否存在：{selected_high in parsed.segment_limits.columns}")
+        st.write(f"selected_low列是否存在：{selected_low in parsed.segment_limits.columns}")
+        if not parsed.segment_limits.empty:
+            st.write("segment_limits的列：", parsed.segment_limits.columns.tolist())
+    
+    # 展示差异烟
+    st.markdown(f"**{selected_high} 与 {selected_low} 差异烟对比**")
+    diff_cols = st.columns(2)
+    diff_cols[0].metric("差异品种数", integer(len(tier_diff)))
+    diff_cols[1].metric("差异总条数", integer(int(tier_diff["新增量"].sum()) if not tier_diff.empty else 0))
+    
+    if not tier_diff.empty:
+        st.dataframe(
+            tier_diff[["价位段", "商品名称", "低档位可订量", "高档位可订量", "新增量"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 st.divider()
 st.subheader("6. 各档位最高利润订购推荐")
@@ -479,7 +522,182 @@ st.dataframe(
 )
 
 st.divider()
-st.subheader("7. 库存估值与盈亏")
+st.subheader("7. 各档位升档打满订单分析")
+
+# 合并dual_summary和profit_recommendation_summary
+if not dual_summary.empty and not profit_recommendation_summary.empty:
+    # 合并两个表格
+    merged_summary = dual_summary.merge(
+        profit_recommendation_summary,
+        on="档位",
+        how="outer",
+        suffixes=("_满订", "_推荐")
+    )
+    
+    # 选择需要的列并重新排列
+    display_columns = [
+        "档位",
+        "最贵满订条数",
+        "最贵满订金额",
+        "最贵满订盈亏",
+        "利润优先满订条数",
+        "利润优先满订盈亏",
+        "推荐条数",
+        "推荐金额",
+        "推荐盈亏",
+        "较利润优先满订条数差",
+        "较利润优先满订盈亏差",
+        "较下一档最贵满订多条数",
+        "较下一档最贵满订多金额"
+    ]
+    
+    # 只保留存在的列
+    existing_columns = [col for col in display_columns if col in merged_summary.columns]
+    final_summary = merged_summary[existing_columns].copy()
+    
+    # 按三十档然后递减排列
+    final_summary["档位序号"] = final_summary["档位"].apply(lambda x: TIER_COLUMNS.index(x) if x in TIER_COLUMNS else 999)
+    final_summary = final_summary.sort_values("档位序号", ascending=True).drop(columns=["档位序号"])
+    
+    # 重命名列以匹配示例
+    column_renames = {
+        "最贵满订条数": "最贵满订条数",
+        "最贵满订金额": "最贵满订金额",
+        "最贵满订盈亏": "最贵满订盈亏",
+        "利润优先满订条数": "利润优先满订条数",
+        "利润优先满订盈亏": "利润优先满订盈亏",
+        "推荐条数": "推荐条数",
+        "推荐金额": "推荐金额",
+        "推荐盈亏": "推荐盈亏",
+        "较利润优先满订条数差": "较利润优先满订条数差",
+        "较利润优先满订盈亏差": "较利润优先满订盈亏差",
+        "较下一档最贵满订多条数": "较下一档最贵满订多条数",
+        "较下一档最贵满订多金额": "较下一档最贵满订多金额"
+    }
+    
+    final_summary = final_summary.rename(columns=column_renames)
+    
+    # 使用Styler添加不同的底色
+    def highlight_sections(val):
+        if isinstance(val, str):
+            return ""
+        return ""
+    
+    # 创建样式器
+    styler = final_summary.style
+    
+    # 为不同部分设置不同的底色
+    # 满订部分使用浅白色背景
+    # 推荐部分使用浅绿色背景
+    # 对比部分使用浅青色背景
+    
+    # 先获取列名
+    cols = final_summary.columns.tolist()
+    
+    # 找到各部分的起始列
+    profit_cols_start = cols.index("推荐条数") if "推荐条数" in cols else len(cols)
+    diff_cols_start = cols.index("较利润优先满订条数差") if "较利润优先满订条数差" in cols else len(cols)
+    
+    # 设置样式
+    for col in cols:
+        col_idx = cols.index(col)
+        if col_idx >= profit_cols_start and col_idx < diff_cols_start:
+            # 推荐部分使用浅绿色
+            styler = styler.set_properties(subset=[col], **{'background-color': '#d4edda'})
+        elif col_idx >= diff_cols_start:
+            # 对比部分使用浅青色
+            styler = styler.set_properties(subset=[col], **{'background-color': '#d1ecf1'})
+        else:
+            # 满订部分使用浅白色
+            styler = styler.set_properties(subset=[col], **{'background-color': '#ffffff'})
+    
+    # 设置表头样式
+    styler = styler.set_table_styles([
+        {'selector': 'th', 'props': [('background-color', '#f8f9fa'), ('font-weight', 'bold')]},
+    ])
+    
+    # 格式化数值列
+    numeric_cols = [col for col in final_summary.columns if col not in ["档位"]]
+    for col in numeric_cols:
+        if "条数" in col:
+            styler = styler.format({col: '{:.0f}'})
+        elif "金额" in col or "盈亏" in col or "差" in col:
+            styler = styler.format({col: '{:.2f}'})
+    
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+
+st.divider()
+st.subheader("9. 本期投放规则展示")
+
+# 展示投放表信息
+if not parsed.strategy_items.empty:
+    # 显示当前选中档位的投放规则
+    show_rule_tier = st.selectbox("选择查看投放规则的档位", TIER_COLUMNS, index=TIER_COLUMNS.index("三十档"), key="show_rule_tier")
+    
+    # 获取该档位的投放数据
+    tier_rule_data = parsed.strategy_items[["价位段", "商品名称", show_rule_tier]].copy()
+    tier_rule_data = tier_rule_data.rename(columns={show_rule_tier: "可订量"})
+    tier_rule_data = tier_rule_data[tier_rule_data["可订量"] > 0].copy()
+    
+    # 计算每个段位的商品数量和总条数
+    segment_summary = tier_rule_data.groupby("价位段", as_index=False).agg(
+        商品数量=("商品名称", "count"),
+        总条数=("可订量", "sum")
+    )
+    
+    # 获取段位上限
+    if not parsed.segment_limits.empty:
+        segment_limits_for_tier = parsed.segment_limits[["价位段", show_rule_tier]].copy()
+        segment_limits_for_tier = segment_limits_for_tier.rename(columns={show_rule_tier: "段位上限"})
+        segment_summary = segment_summary.merge(segment_limits_for_tier, on="价位段", how="left")
+    
+    # 展示段位汇总信息（包括按档位投放）
+    st.markdown(f"**{show_rule_tier} 段位汇总**")
+    
+    # 计算总条数：段位上限总和 + 按档位投放数量
+    if not parsed.segment_limits.empty:
+        # 获取非按档位投放的段位上限总和
+        regular_segment_limits = segment_limits_for_tier[~segment_limits_for_tier["价位段"].isin(["按档位投放"])].copy()
+        limits_total = regular_segment_limits["段位上限"].sum()
+        
+        # 获取按档位投放的数量
+        non_segment_items = tier_rule_data[tier_rule_data["价位段"].isin(["按档位投放"])].copy()
+        non_segment_total = non_segment_items["可订量"].sum() if not non_segment_items.empty else 0
+        
+        # 总条数 = 段位上限总和 + 按档位投放数量
+        total_items = int(limits_total) + int(non_segment_total)
+    else:
+        total_items = tier_rule_data["可订量"].sum()
+    
+    st.dataframe(segment_summary, use_container_width=True, hide_index=True)
+    
+    # 展示总条数
+    st.metric(f"{show_rule_tier} 总可订条数", integer(total_items))
+    
+    # 展示所有档位的投放规则对比（包括按档位投放的明细）
+    st.markdown("**各档位投放规则对比**")
+    
+    # 使用原始数据展示各档位的投放规则对比
+    # 先展示每个商品在各档位的可订量
+    all_tiers_detail = parsed.strategy_items.copy()
+    
+    # 按三十档可订量递减排序
+    if "三十档" in all_tiers_detail.columns:
+        all_tiers_detail = all_tiers_detail.sort_values("三十档", ascending=False).reset_index(drop=True)
+    
+    # 选择要展示的列
+    display_columns = ["价位段", "商品名称"] + [tier for tier in TIER_COLUMNS if tier in all_tiers_detail.columns]
+    all_tiers_detail = all_tiers_detail[display_columns].copy()
+    
+    # 过滤掉可订量全为0的商品
+    if len(TIER_COLUMNS) > 0:
+        mask = all_tiers_detail[TIER_COLUMNS].sum(axis=1) > 0
+        all_tiers_detail = all_tiers_detail[mask].copy()
+    
+    st.dataframe(all_tiers_detail, use_container_width=True, hide_index=True)
+
+st.divider()
+st.subheader("8. 库存估值与盈亏")
 if inventory_file is None:
     st.info("上传库存表后，这里会按库存量而不是订单量做估值与盈亏。")
 else:

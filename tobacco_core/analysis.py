@@ -49,6 +49,7 @@ SEGMENT_ORDER = [
     "11段",
     "12段",
     "13段",
+    "14-15段",
 ]
 
 IGNORED_SEGMENTS = {"二次自选", "二次自选价位段"}
@@ -245,7 +246,7 @@ def parse_strategy(file_obj: BinaryIO) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     limit_rows = data[data["商品名称"].astype(str).str.contains("价位段总量上限", na=False)].copy()
     limit_rows = limit_rows[~limit_rows["价位段"].isin(IGNORED_SEGMENTS)]
     segment_limits = limit_rows[["价位段", *[tier for tier in TIER_COLUMNS if tier in limit_rows.columns]]].copy()
-    segment_limits = segment_limits[segment_limits["价位段"].isin(SEGMENT_ORDER)].reset_index(drop=True)
+    segment_limits = segment_limits[~segment_limits["价位段"].isin(IGNORED_SEGMENTS)].reset_index(drop=True)
 
     item_mask = data["商品名称"].notna() & data["商品名称"].ne("")
     item_mask &= ~data["商品名称"].astype(str).str.contains("价位段总量上限|可订货量合计", na=False)
@@ -273,7 +274,7 @@ def build_analysis_dataset(parsed: ParsedWorkbook) -> pd.DataFrame:
     base["当期找货价格"] = to_numeric(base.get("当期找货价格"))
     base["有效销售价"] = base["当期找货价格"].fillna(base["批发价"])
     base["单条毛利"] = base["有效销售价"] - base["批发价"]
-    base["是否价位段"] = base["价位段"].isin(SEGMENT_ORDER)
+    base["是否价位段"] = ~base["价位段"].isin(IGNORED_SEGMENTS) & ~base["价位段"].isin(NON_SEGMENT_LABELS)
     for column in ["盒码", "条码"]:
         if column in base.columns:
             base[column] = base[column].astype(str).replace("nan", "")
@@ -417,7 +418,14 @@ def compute_tier_plan(data: pd.DataFrame, segment_limits: pd.DataFrame, tier_nam
         allocations.append(non_segment)
 
     unmet_segment_limit = 0
-    for segment in SEGMENT_ORDER:
+    # 收集所有在tier_items中出现的段位（排除非段位标签和被忽略的段位）
+    all_segments = tier_items[
+        (~tier_items["价位段"].isin(NON_SEGMENT_LABELS)) & 
+        (~tier_items["价位段"].isin(IGNORED_SEGMENTS))
+    ]["价位段"].unique().tolist()
+    
+    # 遍历所有段位
+    for segment in all_segments:
         segment_items = tier_items[tier_items["价位段"] == segment].copy()
         if segment_items.empty:
             continue
@@ -447,7 +455,7 @@ def compute_tier_plan(data: pd.DataFrame, segment_limits: pd.DataFrame, tier_nam
         total_market_value=float(line_items["计划市值"].sum()) if not line_items.empty else 0.0,
         total_profit=float(line_items["计划盈亏"].sum()) if not line_items.empty else 0.0,
         non_segment_qty=int(line_items.loc[line_items["价位段"].isin(NON_SEGMENT_LABELS), "计划量"].sum()) if not line_items.empty else 0,
-        segment_qty=int(line_items.loc[line_items["价位段"].isin(SEGMENT_ORDER), "计划量"].sum()) if not line_items.empty else 0,
+        segment_qty=int(line_items.loc[(~line_items["价位段"].isin(NON_SEGMENT_LABELS)) & (~line_items["价位段"].isin(IGNORED_SEGMENTS)), "计划量"].sum()) if not line_items.empty else 0,
         unmet_segment_limit=int(unmet_segment_limit),
         target_total_qty=int((line_items["计划量"].sum() if not line_items.empty else 0) + unmet_segment_limit),
     )
@@ -555,7 +563,7 @@ def recommend_profit_plan(data: pd.DataFrame, segment_limits: pd.DataFrame, tier
         total_market_value=float(line_items["计划市值"].sum()),
         total_profit=float(line_items["计划盈亏"].sum()),
         non_segment_qty=int(line_items.loc[line_items["价位段"].isin(NON_SEGMENT_LABELS), "计划量"].sum()),
-        segment_qty=int(line_items.loc[line_items["价位段"].isin(SEGMENT_ORDER), "计划量"].sum()),
+        segment_qty=int(line_items.loc[(~line_items["价位段"].isin(NON_SEGMENT_LABELS)) & (~line_items["价位段"].isin(IGNORED_SEGMENTS)), "计划量"].sum()),
         unmet_segment_limit=0,
         target_total_qty=total_qty,
     )

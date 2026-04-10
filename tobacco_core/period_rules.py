@@ -39,6 +39,9 @@ def apply_period_rules(products_df: pd.DataFrame, rules_df: pd.DataFrame, preset
     df["规则分组"] = pd.NA
 
     product_rules = rules_df[rules_df["类型"] == "商品"].copy()
+    # 过滤掉二次自行段位的商品
+    product_rules = product_rules[~product_rules["分组"].str.contains("二次", na=False)]
+    product_rules = product_rules[~product_rules["分组"].str.contains("自选", na=False)]
     product_rules[tier_column] = pd.to_numeric(product_rules[tier_column], errors="coerce")
     product_map = product_rules.set_index("商品名称")[tier_column].dropna().to_dict()
     group_map = product_rules.set_index("商品名称")["分组"].to_dict()
@@ -51,8 +54,16 @@ def apply_period_rules(products_df: pd.DataFrame, rules_df: pd.DataFrame, preset
     summary_rules = rules_df[(rules_df["类型"] == "汇总") & rules_df["商品名称"].isin(["可订货量合计", "投放量"])].copy()
     summary_rules[tier_column] = pd.to_numeric(summary_rules[tier_column], errors="coerce")
     summary = {row["商品名称"]: float(row[tier_column]) for _, row in summary_rules.iterrows() if pd.notna(row[tier_column])}
+    
+    # 计算非二次自行段位的商品总条数
+    if tier_column in product_rules.columns:
+        non_secondary_total = product_rules[tier_column].fillna(0).sum()
+        summary["可订货量合计"] = non_secondary_total
 
     band_rules = rules_df[(rules_df["类型"] == "分段上限") & (rules_df["商品名称"] == "价位段总量上限")].copy()
+    # 过滤掉二次自行段位的分段上限
+    band_rules = band_rules[~band_rules["分组"].str.contains("二次", na=False)]
+    band_rules = band_rules[~band_rules["分组"].str.contains("自选", na=False)]
     band_rules[tier_column] = pd.to_numeric(band_rules[tier_column], errors="coerce")
     summary["band_caps"] = {row["分组"]: int(row[tier_column]) for _, row in band_rules.iterrows() if pd.notna(row[tier_column])}
 
@@ -164,6 +175,7 @@ def _normalize_band_name(value) -> str:
         .replace("12段", "12段")
         .replace("13段", "13段")
         .replace("13段", "13段")
+        .replace("14-15段", "14-15段")
     )
     cleaned = cleaned.replace("8-9段", "8-9段").replace("8-9", "8-9段")
     cleaned = cleaned.replace("10段", "10段").replace("11段", "11段").replace("12段", "12段")
