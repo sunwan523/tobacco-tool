@@ -260,7 +260,19 @@ def parse_strategy(file_obj: BinaryIO) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
 
 
 def build_analysis_dataset(parsed: ParsedWorkbook) -> pd.DataFrame:
-    base = enrich_with_price_lookup(parsed.strategy_items, parsed.prices)
+    # 如果有投放表，使用投放表作为基础
+    if not parsed.strategy_items.empty:
+        base = enrich_with_price_lookup(parsed.strategy_items, parsed.prices)
+    else:
+        # 如果没有投放表，使用订单表作为基础
+        base = parsed.orders.copy()
+        # 添加必要的列
+        if "价位段" not in base.columns:
+            base["价位段"] = ""
+        if "商品编码" not in base.columns:
+            base["商品编码"] = ""
+        base = enrich_with_price_lookup(base, parsed.prices)
+    
     base = base.merge(
         parsed.orders[["商品名称", "订单量", "批发价"]].rename(columns={"批发价": "订单批发价"}),
         on="商品名称",
