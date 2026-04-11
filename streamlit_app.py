@@ -170,6 +170,30 @@ elif st.session_state.show_price_table:
     st.dataframe(price_results, width='stretch', hide_index=True)
 
 st.divider()
+st.subheader("导出当前行情价")
+if not db_prices.empty:
+    # 创建下载按钮
+    from io import BytesIO
+    import pandas as pd
+    
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        db_prices.to_excel(writer, index=False, sheet_name='行情价格')
+    output.seek(0)
+    
+    st.download_button(
+        label="下载行情价格表",
+        data=output,
+        file_name="行情价格表.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+    
+    st.info(f"当前共有 {len(db_prices)} 条行情价格数据")
+else:
+    st.info("暂无行情价格数据")
+
+st.divider()
 st.subheader("1. 上传分析文件")
 col1, col2, col3, col4 = st.columns(4)
 with col1:
@@ -740,3 +764,27 @@ else:
                     updated_db = upsert_manual_market_prices(db_prices, manual)
                     save_price_db(updated_db)
                     st.success(f"已把 {len(manual)} 条补录行情写入价格库。刷新后会按新价格重新计算库存估值。")
+
+st.divider()
+st.subheader("导出当前行情价")
+if not db_prices.empty:
+    # 创建下载按钮
+    from io import BytesIO
+    
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        db_prices.to_excel(writer, index=False, sheet_name='行情价格')
+    output.seek(0)
+    
+    st.download_button(
+        label="下载行情价格表",
+        data=output,
+        file_name="行情价格表.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary"
+    )
+    
+    st.info(f"当前共有 {len(db_prices)} 条行情价格数据")
+else:
+    st.info("暂无行情价格数据")
