@@ -1,0 +1,6 @@
+[server]
+port = 18080
+address = "0.0.0.0"
+
+[browser]
+gatherUsageStats = false
