@@ -1,54 +1,54 @@
 from __future__ import annotations
 
+import hashlib
+from io import BytesIO
+from pathlib import Path
+import pickle
+
 import pandas as pd
+import requests
 import streamlit as st
 
 from tobacco_core.analysis import (
     ParsedWorkbook,
     TIER_COLUMNS,
     build_analysis_dataset,
-    build_inventory_dataset,
     build_order_price_check_dataset,
     compare_plan_with_order,
     compute_dual_strategy_summary,
-    compute_inventory_profit,
-    compute_missing_market_prices,
     compute_missing_order_market_prices,
     compute_order_profit,
     compute_profit_recommendation_summary,
     compute_tier_diff,
     compute_tier_plan,
+    get_tier_total_qty,
     get_previous_tier,
     parse_orders,
     parse_strategy,
-    parse_inventory,
-    parse_prices,
     recommend_profit_plan,
 )
-from tobacco_core.price_store import load_price_db, merge_order_products, merge_uploaded_prices, save_price_db, search_prices, upsert_manual_market_prices
+from tobacco_core.price_store import load_price_db, merge_order_products, merge_uploaded_prices, save_price_db, upsert_manual_market_prices
 
 
-st.set_page_config(page_title="梦回唐朝图文店", layout="centered")
+LAST_ANALYSIS_STATE_PATH = Path(__file__).resolve().parent / "data" / "last_analysis_state.pkl"
+
+
+st.set_page_config(page_title="梦回唐朝图文店", layout="wide")
 
 st.markdown(
     """
     <style>
     .block-container {
-        max-width: fit-content;
-        padding-top: 2rem;
-        padding-bottom: 2rem;
+        max-width: 100%;
+        padding-top: 1rem;
+        padding-bottom: 1rem;
+        padding-left: 2rem;
+        padding-right: 2rem;
     }
     h1 {
         font-size: 1.65rem;
         line-height: 1.2;
         margin-bottom: 0.5rem;
-    }
-    .stDataFrame, .stButton, .stFileUploader, .stTextInput, .stAlert {
-        margin-left: auto;
-        margin-right: auto;
-    }
-    div[data-testid="stHorizontalBlock"] {
-        justify-content: center;
     }
     div[data-testid="stMetric"] {
         text-align: center;
@@ -67,7 +67,6 @@ def integer(value: int | float) -> str:
     return f"{int(value):,}"
 
 
-
 def signed_diff_html(value: float, is_money: bool = False) -> str:
     negative = value < 0
     color = "#c62828" if negative else "#2e7d32"
@@ -76,261 +75,412 @@ def signed_diff_html(value: float, is_money: bool = False) -> str:
     return f"<div style='text-align:center;color:{color};font-weight:{weight};font-size:1.15rem'>{display}</div>"
 
 
-st.title("梦回唐朝图文店")
+def file_signature(name: str | None, data: bytes | None) -> str | None:
+    if data is None:
+        return None
+    digest = hashlib.md5(data).hexdigest()
+    return f"{name or ''}:{len(data)}:{digest}"
 
+
+def make_uploaded_file(data: bytes | None, name: str | None):
+    if data is None:
+        return None
+    file_obj = BytesIO(data)
+    file_obj.name = name
+    return file_obj
+
+
+def load_last_analysis_state() -> None:
+    if st.session_state.get("_last_analysis_state_loaded"):
+        return
+    st.session_state._last_analysis_state_loaded = True
+    if not LAST_ANALYSIS_STATE_PATH.exists():
+        return
+    try:
+        with LAST_ANALYSIS_STATE_PATH.open("rb") as handle:
+            state = pickle.load(handle)
+    except Exception:
+        return
+    for key in [
+        "analysis_started",
+        "saved_strategy_file",
+        "saved_strategy_name",
+        "saved_strategy_signature",
+        "saved_order_file",
+        "saved_order_name",
+        "saved_order_signature",
+        "cached_analysis_results",
+    ]:
+        if key in state:
+            st.session_state[key] = state[key]
+
+
+def save_last_analysis_state() -> None:
+    LAST_ANALYSIS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "analysis_started": st.session_state.analysis_started,
+        "saved_strategy_file": st.session_state.saved_strategy_file,
+        "saved_strategy_name": st.session_state.saved_strategy_name,
+        "saved_strategy_signature": st.session_state.saved_strategy_signature,
+        "saved_order_file": st.session_state.saved_order_file,
+        "saved_order_name": st.session_state.saved_order_name,
+        "saved_order_signature": st.session_state.saved_order_signature,
+        "cached_analysis_results": st.session_state.get("cached_analysis_results"),
+    }
+    with LAST_ANALYSIS_STATE_PATH.open("wb") as handle:
+        pickle.dump(state, handle)
+
+
+def stage_uploaded_file(uploaded_file, prefix: str) -> bool:
+    data_key = f"pending_{prefix}_file"
+    name_key = f"pending_{prefix}_name"
+    signature_key = f"pending_{prefix}_signature"
+    saved_signature_key = f"saved_{prefix}_signature"
+    if uploaded_file is None:
+        st.session_state[data_key] = None
+        st.session_state[name_key] = None
+        st.session_state[signature_key] = None
+        return False
+
+    data = uploaded_file.getvalue()
+    signature = file_signature(uploaded_file.name, data)
+    if signature == st.session_state.get(saved_signature_key):
+        st.session_state[data_key] = None
+        st.session_state[name_key] = None
+        st.session_state[signature_key] = None
+        return False
+
+    st.session_state[data_key] = data
+    st.session_state[name_key] = uploaded_file.name
+    st.session_state[signature_key] = signature
+    return True
+
+
+def get_analysis_file(prefix: str, use_pending: bool):
+    if use_pending and st.session_state.get(f"pending_{prefix}_file") is not None:
+        return make_uploaded_file(st.session_state.get(f"pending_{prefix}_file"), st.session_state.get(f"pending_{prefix}_name"))
+    return make_uploaded_file(st.session_state.get(f"saved_{prefix}_file"), st.session_state.get(f"saved_{prefix}_name"))
+
+
+def commit_active_analysis_files(use_pending: bool) -> None:
+    for prefix in ["strategy", "order"]:
+        if use_pending and st.session_state.get(f"pending_{prefix}_file") is not None:
+            st.session_state[f"saved_{prefix}_file"] = st.session_state.get(f"pending_{prefix}_file")
+            st.session_state[f"saved_{prefix}_name"] = st.session_state.get(f"pending_{prefix}_name")
+            st.session_state[f"saved_{prefix}_signature"] = st.session_state.get(f"pending_{prefix}_signature")
+            st.session_state[f"pending_{prefix}_file"] = None
+            st.session_state[f"pending_{prefix}_name"] = None
+            st.session_state[f"pending_{prefix}_signature"] = None
+    st.session_state.analysis_started = True
+    save_last_analysis_state()
+
+
+def cache_analysis_results(**results) -> None:
+    st.session_state.cached_analysis_results = results
+    save_last_analysis_state()
+
+
+# 初始化 session_state 变量
 if "analysis_started" not in st.session_state:
     st.session_state.analysis_started = False
 
-if "last_saved_price_upload_key" not in st.session_state:
-    st.session_state.last_saved_price_upload_key = None
+# 持久化上次成功计算使用的文件
+if "saved_strategy_file" not in st.session_state:
+    st.session_state.saved_strategy_file = None
+if "saved_strategy_name" not in st.session_state:
+    st.session_state.saved_strategy_name = None
+if "saved_strategy_signature" not in st.session_state:
+    st.session_state.saved_strategy_signature = None
+if "saved_order_file" not in st.session_state:
+    st.session_state.saved_order_file = None
+if "saved_order_name" not in st.session_state:
+    st.session_state.saved_order_name = None
+if "saved_order_signature" not in st.session_state:
+    st.session_state.saved_order_signature = None
+if "cached_analysis_results" not in st.session_state:
+    st.session_state.cached_analysis_results = None
+for prefix in ["strategy", "order"]:
+    for suffix in ["file", "name", "signature"]:
+        key = f"pending_{prefix}_{suffix}"
+        if key not in st.session_state:
+            st.session_state[key] = None
+
+load_last_analysis_state()
+
+st.title("梦回唐朝图文店")
 
 db_prices = load_price_db()
 
-st.subheader("曲靖本地近期行情价格查询")
-if "price_search_text" not in st.session_state:
-    st.session_state.price_search_text = ""
-if "price_edits" not in st.session_state:
-    st.session_state.price_edits = {}
-if "show_price_table" not in st.session_state:
-    st.session_state.show_price_table = False
-
-with st.form("price_search_form", clear_on_submit=False):
-    search_col, button_col = st.columns([4, 1], gap="small")
-    with search_col:
-        search_text = st.text_input(
-            "价格查询",
-            value=st.session_state.price_search_text,
-            placeholder="输入商品名、拼音首字母、条码或盒码",
-            label_visibility="collapsed",
-        )
-    with button_col:
-        submitted = st.form_submit_button("查询", width='stretch')
-
-if submitted:
-    st.session_state.price_search_text = search_text.strip()
-    st.session_state.price_edits = {}
-    st.session_state.show_price_table = True
-
-price_results = search_prices(db_prices, st.session_state.price_search_text)
-
-# 显示可编辑的价格表格
-if st.session_state.show_price_table and not price_results.empty:
-    # 调整列顺序，将当期找货价格列放到商品名称后面，隐藏盒码和条码
-    columns = ["商品名称", "当期找货价格", "建议零售价", "批发价"]
-    price_results = price_results[columns]
-    
-    edited_df = st.data_editor(
-        price_results,
-        column_config={
-            "当期找货价格": st.column_config.NumberColumn(
-                "行情价",
-                min_value=0,
-                step=0.01,
-                format="%.2f",
-                help="可编辑的行情价格"
-            )
-        },
-        disabled=["商品名称", "建议零售价", "批发价"],
-        hide_index=True,
-        width='stretch'
-    )
-    
-    # 检查是否有修改
-    if not edited_df.equals(price_results):
-        # 收集修改的价格
-        price_edits = {}
-        for idx, row in edited_df.iterrows():
-            original_price = price_results.at[idx, "当期找货价格"]
-            new_price = row["当期找货价格"]
-            if original_price != new_price:
-                # 使用商品名称作为键，因为它是唯一的
-                key = row["商品名称"]
-                price_edits[key] = new_price
-        st.session_state.price_edits = price_edits
-        
-        # 添加密码输入和保存按钮
-        if st.session_state.price_edits:
-            st.write("\n")
-            password = st.text_input("请输入密码以保存价格修改", type="password")
-            if st.button("保存价格修改"):
-                if password == "523626":
-                    # 更新价格数据库
-                    updated_prices = db_prices.copy()
-                    for product_name, new_price in st.session_state.price_edits.items():
-                        updated_prices.loc[updated_prices["商品名称"] == product_name, "当期找货价格"] = new_price
-                    save_price_db(updated_prices)
-                    st.success("价格修改已成功保存！")
-                    # 重新加载价格数据
-                    db_prices = load_price_db()
-                    # 清空编辑状态
-                    st.session_state.price_edits = {}
-                else:
-                    st.error("密码错误，请重新输入！")
-elif st.session_state.show_price_table:
-    st.dataframe(price_results, width='stretch', hide_index=True)
-
-st.divider()
 st.subheader("1. 上传分析文件")
-col1, col2, col3, col4 = st.columns(4)
+col1, col2 = st.columns(2)
 with col1:
-    strategy_file = st.file_uploader("订货量 / 投放表", type=["xlsx"], key="strategy_file")
+    uploaded_strategy_file = st.file_uploader("订货量 / 投放表", type=["xlsx"], key="strategy_file")
+    strategy_changed = stage_uploaded_file(uploaded_strategy_file, "strategy")
 with col2:
-    order_file = st.file_uploader("订单明细（可选）", type=["xlsx"], key="order_file")
-with col3:
-    inventory_file = st.file_uploader("库存表", type=["xlsx"], key="inventory_file")
-with col4:
-    price_file = st.file_uploader("上传最新行情价格", type=["xlsx"], key="price_file")
+    uploaded_order_file = st.file_uploader("订单明细（可选）", type=["xlsx"], key="order_file")
+    order_changed = stage_uploaded_file(uploaded_order_file, "order")
 
-analysis_password = st.text_input("分析密码", type="password", placeholder="请输入开始计算密码")
-password_correct = analysis_password == "523626"
-current_price_upload_key = None if price_file is None else f"{price_file.name}:{price_file.size}"
+has_pending_upload = strategy_changed or order_changed
 
-if st.button("开始计算", type="primary", use_container_width=True, disabled=not password_correct):
-    st.session_state.analysis_started = True
+def fetch_market_prices_from_api() -> pd.DataFrame:
+    try:
+        response = requests.get("http://localhost:9527/api/market-price/all", timeout=10)
+        response.raise_for_status()
+        data = response.json()
 
-if analysis_password and not password_correct:
-    st.warning("密码不正确，无法开始计算。")
+        if isinstance(data, dict):
+            data = data.get("data", [])
+        if not isinstance(data, list) or len(data) == 0:
+            return pd.DataFrame()
 
-if not password_correct:
+        df = pd.DataFrame(data)
+        rename_map = {
+            "product_name": "商品名称",
+            "name": "商品名称",
+            "suggested_price": "建议零售价",
+            "retail_price": "建议零售价",
+            "price": "批发价",
+            "purchase_price": "批发价",
+            "market_price": "当期找货价格",
+            "product_code": "条码",
+            "barcode": "条码",
+            "box_code": "盒码",
+        }
+        df = df.rename(columns={key: value for key, value in rename_map.items() if key in df.columns})
+        required_cols = ["商品名称", "建议零售价", "批发价", "当期找货价格", "盒码", "条码"]
+        if "商品名称" not in df.columns:
+            return pd.DataFrame()
+
+        for column in required_cols:
+            if column not in df.columns:
+                df[column] = pd.NA
+        for column in ["建议零售价", "批发价", "当期找货价格"]:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+        for column in ["盒码", "条码"]:
+            df[column] = df[column].astype("string").str.replace(r"\.0$", "", regex=True).str.strip()
+
+        df = df[df["商品名称"].notna()].copy()
+        df["商品名称"] = df["商品名称"].astype(str).str.strip()
+        df = df[df["商品名称"].ne("")]
+        return (
+            df[required_cols]
+            .drop_duplicates(subset=["商品名称", "条码"], keep="last")
+            .reset_index(drop=True)
+        )
+    except Exception as e:
+        st.warning(f"从 API 获取行情价格失败: {e}")
+        return pd.DataFrame()
+
+col1, col2 = st.columns([3, 1])
+with col1:
+    calculation_requested = st.button("开始计算", type="primary", use_container_width=True)
+with col2:
+    clear_cache = st.button("清除数据", use_container_width=True)
+
+use_pending_files = calculation_requested and has_pending_upload
+
+if clear_cache:
     st.session_state.analysis_started = False
-    st.info("请输入正确密码后，再点击“开始计算”。")
-    st.stop()
+    st.session_state.saved_strategy_file = None
+    st.session_state.saved_strategy_name = None
+    st.session_state.saved_strategy_signature = None
+    st.session_state.saved_order_file = None
+    st.session_state.saved_order_name = None
+    st.session_state.saved_order_signature = None
+    st.session_state.cached_analysis_results = None
+    st.session_state.pending_strategy_file = None
+    st.session_state.pending_strategy_name = None
+    st.session_state.pending_strategy_signature = None
+    st.session_state.pending_order_file = None
+    st.session_state.pending_order_name = None
+    st.session_state.pending_order_signature = None
+    if LAST_ANALYSIS_STATE_PATH.exists():
+        LAST_ANALYSIS_STATE_PATH.unlink()
+    st.rerun()
+
+if calculation_requested:
+    st.session_state.analysis_started = True
 
 if not st.session_state.analysis_started:
     st.info("文件上传完成后，点击“开始计算”再执行分析。")
     st.stop()
 
-if price_file is not None and current_price_upload_key != st.session_state.last_saved_price_upload_key:
-    uploaded_prices = parse_prices(price_file)
-    db_prices = merge_uploaded_prices(db_prices, uploaded_prices)
-    save_price_db(db_prices)
-    st.session_state.last_saved_price_upload_key = current_price_upload_key
-    st.success(f"已更新行情价格库，本次写入 {len(uploaded_prices)} 条价格记录。")
+if has_pending_upload and not calculation_requested:
+    st.info("已选择新的投放表或订单明细。当前仍展示上次计算结果，点击“开始计算”后会更新并保存新结果。")
 
-if db_prices.empty:
-    st.error("当前行情价格库为空，无法引用历史批发价，请先上传一份行情价格表初始化价格库。")
-    st.stop()
+strategy_file = get_analysis_file("strategy", use_pending_files)
+order_file = get_analysis_file("order", use_pending_files)
 
-try:
-    # 初始化变量
-    strategy_items = pd.DataFrame()
-    segment_limits = pd.DataFrame()
-    tier_totals = pd.DataFrame()
-    empty_order = pd.DataFrame(columns=["商品名称", "批发价", "订单量"])
-    
-    # 如果有投放表，解析投放表
-    if strategy_file is not None:
-        strategy_items, segment_limits, tier_totals = parse_strategy(strategy_file)
-    
-    # 如果有订单表，解析订单表
-    if order_file is None:
-        orders = empty_order
-    else:
-        orders = parse_orders(order_file)
-        db_prices = merge_order_products(db_prices, orders)
-        save_price_db(db_prices)
-    
-    # 创建parsed对象
-    parsed = ParsedWorkbook(
-        orders=orders,
-        prices=db_prices.copy(),
-        strategy_items=strategy_items,
-        segment_limits=segment_limits,
-        tier_totals=tier_totals,
-        )
-    analysis_data = build_analysis_dataset(parsed)
-except Exception as exc:
-    st.error(f"订单或订货量文件解析失败：{exc}")
-    st.stop()
+cached_analysis_results = st.session_state.get("cached_analysis_results")
+use_cached_analysis_results = not calculation_requested and cached_analysis_results is not None
 
-inventory_profit = pd.DataFrame()
-missing_market_prices = pd.DataFrame()
-missing_order_market_prices = pd.DataFrame()
-if inventory_file is not None:
+if use_cached_analysis_results:
+    parsed = cached_analysis_results["parsed"]
+    analysis_data = cached_analysis_results["analysis_data"]
+    missing_order_market_prices = cached_analysis_results["missing_order_market_prices"]
+    has_order = cached_analysis_results["has_order"]
+    has_strategy = cached_analysis_results["has_strategy"]
+    order_profit = cached_analysis_results["order_profit"]
+    order_total_qty = cached_analysis_results["order_total_qty"]
+    order_total_cost = cached_analysis_results["order_total_cost"]
+    order_total_profit = cached_analysis_results["order_total_profit"]
+    current_tier = cached_analysis_results["current_tier"]
+    tier_reason = cached_analysis_results["tier_reason"]
+    compare_tier = cached_analysis_results["compare_tier"]
+    current_cost_plan = cached_analysis_results["current_cost_plan"]
+    current_profit_plan = cached_analysis_results["current_profit_plan"]
+    compare_cost_plan = cached_analysis_results["compare_cost_plan"]
+    dual_summary = cached_analysis_results["dual_summary"]
+    profit_recommendation_summary = cached_analysis_results["profit_recommendation_summary"]
+    db_prices = cached_analysis_results["db_prices"]
+else:
+    if calculation_requested:
+        uploaded_prices = fetch_market_prices_from_api()
+        if not uploaded_prices.empty:
+            db_prices = merge_uploaded_prices(db_prices, uploaded_prices)
+            save_price_db(db_prices)
+            st.success(f"已从 API 更新行情价格库，本次写入 {len(uploaded_prices)} 条价格记录。")
+
+    if db_prices.empty:
+        st.error("当前行情价格库为空，无法引用历史批发价，请检查本地 API 服务是否正常运行。")
+        st.stop()
+
     try:
-        inventory_data = build_inventory_dataset(parse_inventory(inventory_file), db_prices)
-        inventory_profit = compute_inventory_profit(inventory_data)
-        missing_market_prices = compute_missing_market_prices(inventory_data)
-    except Exception as exc:
-        st.error(f"库存表解析失败：{exc}")
-
-has_order = order_file is not None
-has_strategy = strategy_file is not None
-
-# 如果有订单表，计算订单盈亏
-order_profit = pd.DataFrame()
-if has_order:
-    try:
-        # 直接用订单表构建一个简单的分析数据，确保订单盈亏分析能正常工作
-        if not has_strategy:
-            # 如果没有投放表，直接用订单表和价格表构建数据
-            order_analysis_data = parsed.orders.copy()
-            # 合并价格信息
-            if "商品名称" in order_analysis_data.columns and "商品名称" in db_prices.columns:
-                price_cols = ["商品名称", "批发价", "建议零售价", "当期找货价格"]
-                existing_price_cols = [col for col in price_cols if col in db_prices.columns]
-                order_analysis_data = order_analysis_data.merge(
-                    db_prices[existing_price_cols],
-                    on="商品名称",
-                    how="left",
-                    suffixes=("", "_price")
-                )
-                # 使用价格库的批发价
-                if "批发价_price" in order_analysis_data.columns:
-                    order_analysis_data["批发价"] = order_analysis_data["批发价_price"].fillna(order_analysis_data.get("批发价"))
-                # 使用价格库的当期找货价格
-                if "当期找货价格_price" in order_analysis_data.columns:
-                    order_analysis_data["当期找货价格"] = order_analysis_data["当期找货价格_price"].fillna(order_analysis_data.get("当期找货价格"))
-            
-            # 确保有必要的列
-            if "价位段" not in order_analysis_data.columns:
-                order_analysis_data["价位段"] = ""
-            if "有效销售价" not in order_analysis_data.columns:
-                order_analysis_data["有效销售价"] = order_analysis_data.get("当期找货价格", pd.Series()).fillna(order_analysis_data.get("批发价"))
-            if "单条毛利" not in order_analysis_data.columns:
-                order_analysis_data["单条毛利"] = order_analysis_data["有效销售价"] - order_analysis_data["批发价"]
-            
-            # 计算订单盈亏
-            temp_order_profit = order_analysis_data[order_analysis_data["订单量"] > 0].copy()
-            temp_order_profit["订单成本"] = temp_order_profit["订单量"] * temp_order_profit["批发价"]
-            temp_order_profit["订单估值"] = temp_order_profit["订单量"] * temp_order_profit["有效销售价"]
-            temp_order_profit["订单盈亏"] = temp_order_profit["订单量"] * temp_order_profit["单条毛利"]
-            order_profit = temp_order_profit.sort_values(["订单盈亏", "订单成本"], ascending=[False, False]).reset_index(drop=True)
+        # 初始化变量
+        strategy_items = pd.DataFrame()
+        segment_limits = pd.DataFrame()
+        tier_totals = pd.DataFrame()
+        empty_order = pd.DataFrame(columns=["商品名称", "批发价", "订单量"])
+    
+        # 如果有投放表，解析投放表
+        if strategy_file is not None:
+            strategy_items, segment_limits, tier_totals = parse_strategy(strategy_file)
+    
+        # 如果有订单表，解析订单表
+        if order_file is None:
+            orders = empty_order
         else:
-            # 如果有投放表，使用原来的方法
-            order_profit = compute_order_profit(analysis_data)
-    except Exception as e:
-        st.warning(f"计算订单盈亏时出错：{e}，将使用简化方法计算")
-        # 简化方法
-        if "订单量" in parsed.orders.columns and "批发价" in parsed.orders.columns:
-            temp = parsed.orders[parsed.orders["订单量"] > 0].copy()
-            temp["订单成本"] = temp["订单量"] * temp["批发价"]
-            order_profit = temp
+            orders = parse_orders(order_file)
+            db_prices = merge_order_products(db_prices, orders)
+            save_price_db(db_prices)
+    
+        # 创建parsed对象
+        parsed = ParsedWorkbook(
+            orders=orders,
+            prices=db_prices.copy(),
+            strategy_items=strategy_items,
+            segment_limits=segment_limits,
+            tier_totals=tier_totals,
+        )
+        analysis_data = build_analysis_dataset(parsed)
+    except Exception as exc:
+        st.error(f"订单或订货量文件解析失败：{exc}")
+        st.stop()
 
-if has_order:
-    order_price_check = build_order_price_check_dataset(parsed.orders, db_prices)
-    missing_order_market_prices = compute_missing_order_market_prices(order_price_check)
 
-order_total_qty = int(order_profit["订单量"].sum()) if not order_profit.empty and "订单量" in order_profit.columns else 0
-order_total_cost = float(order_profit["订单成本"].sum()) if not order_profit.empty and "订单成本" in order_profit.columns else 0.0
-order_total_profit = float(order_profit["订单盈亏"].sum()) if not order_profit.empty and "订单盈亏" in order_profit.columns else 0.0
-current_tier = "三十档"
-tier_reason = "按你的使用口径固定为三十档订单" if has_order else "未上传订单，按默认三十档展示可计算结果"
-compare_tier = get_previous_tier(current_tier) if has_strategy else None
+    missing_order_market_prices = pd.DataFrame()
 
-# 只有有投放表时才计算满订计划
-current_cost_plan = None
-current_profit_plan = None
-compare_cost_plan = None
-dual_summary = pd.DataFrame()
-profit_recommendation_summary = pd.DataFrame()
+    has_order = order_file is not None
+    has_strategy = strategy_file is not None
 
-if has_strategy:
-    current_cost_plan = compute_tier_plan(analysis_data, parsed.segment_limits, current_tier, "cost")
-    current_profit_plan = compute_tier_plan(analysis_data, parsed.segment_limits, current_tier, "profit")
-    compare_cost_plan = compute_tier_plan(analysis_data, parsed.segment_limits, compare_tier, "cost") if compare_tier else None
-    dual_summary = compute_dual_strategy_summary(analysis_data, parsed.segment_limits, parsed.tier_totals)
-    profit_recommendation_summary = compute_profit_recommendation_summary(analysis_data, parsed.segment_limits)
+    # 如果有订单表，计算订单盈亏
+    order_profit = pd.DataFrame()
+    if has_order:
+        try:
+            # 直接用订单表构建一个简单的分析数据，确保订单盈亏分析能正常工作
+            if not has_strategy:
+                # 如果没有投放表，直接用订单表和价格表构建数据
+                order_analysis_data = parsed.orders.copy()
+                # 合并价格信息
+                if "商品名称" in order_analysis_data.columns and "商品名称" in db_prices.columns:
+                    price_cols = ["商品名称", "批发价", "建议零售价", "当期找货价格"]
+                    existing_price_cols = [col for col in price_cols if col in db_prices.columns]
+                    order_analysis_data = order_analysis_data.merge(
+                        db_prices[existing_price_cols],
+                        on="商品名称",
+                        how="left",
+                        suffixes=("", "_price")
+                    )
+                    # 使用价格库的批发价
+                    if "批发价_price" in order_analysis_data.columns:
+                        order_analysis_data["批发价"] = order_analysis_data["批发价_price"].fillna(order_analysis_data.get("批发价"))
+                    # 使用价格库的当期找货价格
+                    if "当期找货价格_price" in order_analysis_data.columns:
+                        order_analysis_data["当期找货价格"] = order_analysis_data["当期找货价格_price"].fillna(order_analysis_data.get("当期找货价格"))
+            
+                # 确保有必要的列
+                if "价位段" not in order_analysis_data.columns:
+                    order_analysis_data["价位段"] = ""
+                if "有效销售价" not in order_analysis_data.columns:
+                    order_analysis_data["有效销售价"] = order_analysis_data.get("当期找货价格", pd.Series()).fillna(order_analysis_data.get("批发价"))
+                if "单条毛利" not in order_analysis_data.columns:
+                    order_analysis_data["单条毛利"] = order_analysis_data["有效销售价"] - order_analysis_data["批发价"]
+            
+                # 计算订单盈亏
+                temp_order_profit = order_analysis_data[order_analysis_data["订单量"] > 0].copy()
+                temp_order_profit["订单成本"] = temp_order_profit["订单量"] * temp_order_profit["批发价"]
+                temp_order_profit["订单估值"] = temp_order_profit["订单量"] * temp_order_profit["有效销售价"]
+                temp_order_profit["订单盈亏"] = temp_order_profit["订单量"] * temp_order_profit["单条毛利"]
+                order_profit = temp_order_profit.sort_values(["订单盈亏", "订单成本"], ascending=[False, False]).reset_index(drop=True)
+            else:
+                # 如果有投放表，使用原来的方法
+                order_profit = compute_order_profit(analysis_data)
+        except Exception as e:
+            st.warning(f"计算订单盈亏时出错：{e}，将使用简化方法计算")
+            # 简化方法
+            if "订单量" in parsed.orders.columns and "批发价" in parsed.orders.columns:
+                temp = parsed.orders[parsed.orders["订单量"] > 0].copy()
+                temp["订单成本"] = temp["订单量"] * temp["批发价"]
+                order_profit = temp
+
+    if has_order:
+        order_price_check = build_order_price_check_dataset(parsed.orders, db_prices)
+        missing_order_market_prices = compute_missing_order_market_prices(order_price_check)
+
+    order_total_qty = int(order_profit["订单量"].sum()) if not order_profit.empty and "订单量" in order_profit.columns else 0
+    order_total_cost = float(order_profit["订单成本"].sum()) if not order_profit.empty and "订单成本" in order_profit.columns else 0.0
+    order_total_profit = float(order_profit["订单盈亏"].sum()) if not order_profit.empty and "订单盈亏" in order_profit.columns else 0.0
+    current_tier = "三十档"
+    tier_reason = "按你的使用口径固定为三十档订单" if has_order else "未上传订单，按默认三十档展示可计算结果"
+    compare_tier = get_previous_tier(current_tier) if has_strategy else None
+
+    # 只有有投放表时才计算满订计划
+    current_cost_plan = None
+    current_profit_plan = None
+    compare_cost_plan = None
+    dual_summary = pd.DataFrame()
+    profit_recommendation_summary = pd.DataFrame()
+
+    if has_strategy:
+        current_cost_plan = compute_tier_plan(analysis_data, parsed.segment_limits, current_tier, "cost", get_tier_total_qty(parsed.tier_totals, current_tier))
+        current_profit_plan = compute_tier_plan(analysis_data, parsed.segment_limits, current_tier, "profit", get_tier_total_qty(parsed.tier_totals, current_tier))
+        compare_cost_plan = compute_tier_plan(analysis_data, parsed.segment_limits, compare_tier, "cost", get_tier_total_qty(parsed.tier_totals, compare_tier)) if compare_tier else None
+        dual_summary = compute_dual_strategy_summary(analysis_data, parsed.segment_limits, parsed.tier_totals)
+        profit_recommendation_summary = compute_profit_recommendation_summary(analysis_data, parsed.segment_limits, parsed.tier_totals)
+
+
+    if calculation_requested:
+        commit_active_analysis_files(use_pending_files)
+    cache_analysis_results(
+        parsed=parsed,
+        analysis_data=analysis_data,
+        missing_order_market_prices=missing_order_market_prices,
+        has_order=has_order,
+        has_strategy=has_strategy,
+        order_profit=order_profit,
+        order_total_qty=order_total_qty,
+        order_total_cost=order_total_cost,
+        order_total_profit=order_total_profit,
+        current_tier=current_tier,
+        tier_reason=tier_reason,
+        compare_tier=compare_tier,
+        current_cost_plan=current_cost_plan,
+        current_profit_plan=current_profit_plan,
+        compare_cost_plan=compare_cost_plan,
+        dual_summary=dual_summary,
+        profit_recommendation_summary=profit_recommendation_summary,
+        db_prices=db_prices,
+    )
 
 st.subheader("识别结果")
 if has_order:
@@ -344,7 +494,7 @@ else:
     meta = st.columns(3)
     meta[0].metric("推断当前档位", current_tier)
     meta[1].metric("对比档位", compare_tier or "无")
-st.caption(f"档位推断口径：{tier_reason}。二次自选整段已完全忽略，不参与任何订购、满订和推荐。若本次未上传行情表，则直接使用本地价格库中的批发价/找货价；找货价缺失时回退批发价。")
+st.caption(f"档位推断口径：{tier_reason}。投放表中标记为二次自选或控制量的行不会作为商品参与订购、满订和推荐。若本次未上传行情表，则直接使用本地价格库中的批发价/找货价；找货价缺失时回退批发价。")
 
 st.divider()
 st.subheader("2. 订单与下一档位最高最贵满订差异")
@@ -362,12 +512,12 @@ else:
     cols[1].metric("对比档位", compare_tier)
     cols[2].metric(f"{compare_tier}最高最贵满订金额", money(compare_cost_plan.total_cost))
     with cols[3]:
-        st.markdown("<div style='text-align:center;'>与当前订单金额差</div>", unsafe_allow_html=True)
+        st.markdown("<div style='text-align:center'>与当前订单金额差</div>", unsafe_allow_html=True)
         st.markdown(signed_diff_html(amount_diff, is_money=True), unsafe_allow_html=True)
     cols2 = st.columns(4)
     cols2[0].metric(f"{compare_tier}最高最贵满订条数", integer(compare_cost_plan.total_qty))
     with cols2[1]:
-        st.markdown("<div style='text-align:center;'>与当前订单条数差</div>", unsafe_allow_html=True)
+        st.markdown("<div style='text-align:center'>与当前订单条数差</div>", unsafe_allow_html=True)
         st.markdown(signed_diff_html(qty_diff, is_money=False), unsafe_allow_html=True)
     cols2[2].metric(f"{compare_tier}最高最贵满订盈亏", money(compare_cost_plan.total_profit))
     cols2[3].metric("未满足段上限", integer(compare_cost_plan.unmet_segment_limit))
@@ -443,8 +593,8 @@ else:
     st.dataframe(dual_summary, use_container_width=True, hide_index=True)
 
     selected_detail_tier = st.selectbox("查看满订明细档位", TIER_COLUMNS, index=TIER_COLUMNS.index("三十档"), key="selected_detail_tier")
-    selected_cost_plan = compute_tier_plan(analysis_data, parsed.segment_limits, selected_detail_tier, "cost")
-    selected_profit_plan = compute_tier_plan(analysis_data, parsed.segment_limits, selected_detail_tier, "profit")
+    selected_cost_plan = compute_tier_plan(analysis_data, parsed.segment_limits, selected_detail_tier, "cost", get_tier_total_qty(parsed.tier_totals, selected_detail_tier))
+    selected_profit_plan = compute_tier_plan(analysis_data, parsed.segment_limits, selected_detail_tier, "profit", get_tier_total_qty(parsed.tier_totals, selected_detail_tier))
 
     st.markdown(f"**{selected_detail_tier}最高最贵满订明细**")
     st.dataframe(
@@ -457,8 +607,8 @@ else:
     st.dataframe(
         selected_profit_plan.line_items[["来源", "价位段", "商品名称", "档位可订量", "计划量", "批发价", "计划成本", "计划盈亏"]],
         use_container_width=True,
-    hide_index=True,
-)
+        hide_index=True,
+    )
 
 st.divider()
 st.subheader("5. 档位差异烟对比")
@@ -478,7 +628,7 @@ else:
         # 展示各段位上限对比
         st.markdown(f"**{selected_high} 与 {selected_low} 各段位上限对比**")
         
-        # 从segment_limits中获取各段位上限
+        # 从segment_limits获取各段位上限
         if not parsed.segment_limits.empty and selected_high in parsed.segment_limits.columns and selected_low in parsed.segment_limits.columns:
             # 获取两个档位的段位上限数据
             segment_limits_comparison = parsed.segment_limits[["价位段", selected_high, selected_low]].copy()
@@ -529,8 +679,8 @@ else:
         st.info(f"{recommend_tier} 已经没有更低一档可作为对比，暂时无法生成推荐。")
     else:
         st.caption(f"先按 {recommend_tier} 利润优先满订生成方案，再从单条毛利最低的商品开始逐条删减；每删一条都校验一次，直到再删就会导致总条数或总金额不再高于 {recommend_compare_tier} 最高最贵满订。")
-        profit_recommendation = recommend_profit_plan(analysis_data, parsed.segment_limits, recommend_tier)
-        compare_cost_recommendation = compute_tier_plan(analysis_data, parsed.segment_limits, recommend_compare_tier, "cost")
+        profit_recommendation = recommend_profit_plan(analysis_data, parsed.segment_limits, recommend_tier, parsed.tier_totals)
+        compare_cost_recommendation = compute_tier_plan(analysis_data, parsed.segment_limits, recommend_compare_tier, "cost", get_tier_total_qty(parsed.tier_totals, recommend_compare_tier))
         if profit_recommendation is None:
             st.warning(f"没有找到同时满足“总条数和总金额都高于 {recommend_compare_tier} 最高最贵满订”的 {recommend_tier} 利润推荐方案。")
         else:
@@ -582,22 +732,84 @@ else:
                     st.success("当前订单已经和这套推荐方案一致，不需要修改。")
 if has_strategy:
     st.markdown("**各档位最高利润推荐汇总**")
+    
+    # 合并dual_summary和profit_recommendation_summary，包含最贵满订相关列
+    merged_profit_summary = dual_summary.merge(
+        profit_recommendation_summary,
+        on="档位",
+        how="outer",
+        suffixes=("_满订", "_推荐")
+    )
+    
+    # 选择需要的列并重新排列
+    profit_display_columns = [
+        "档位",
+        "最贵满订条数",
+        "最贵满订金额",
+        "最贵满订盈亏",
+        "利润优先满订条数",
+        "利润优先满订金额",
+        "利润优先满订盈亏",
+        "推荐条数",
+        "推荐金额",
+        "推荐盈亏",
+        "较利润优先满订条数差",
+        "较利润优先满订金额差",
+        "较利润优先满订盈亏差",
+        "较下一档最贵满订多条数",
+        "较下一档最贵满订多金额"
+    ]
+    
+    # 只保留存在的列
+    profit_existing_columns = [col for col in profit_display_columns if col in merged_profit_summary.columns]
+    profit_summary_display = merged_profit_summary[profit_existing_columns].copy()
+    
+    # 按三十档然后递减排列
+    profit_summary_display["档位序号"] = profit_summary_display["档位"].apply(lambda x: TIER_COLUMNS.index(x) if x in TIER_COLUMNS else 999)
+    profit_summary_display = profit_summary_display.sort_values("档位序号", ascending=True).drop(columns=["档位序号"])
+    profit_format_map = {}
+    for col in [col for col in profit_summary_display.columns if col != "档位"]:
+        profit_summary_display[col] = pd.to_numeric(profit_summary_display[col], errors="coerce").fillna(0)
+        if "条数" in col:
+            profit_summary_display[col] = profit_summary_display[col].astype(int)
+            profit_format_map[col] = "{:.0f}"
+        else:
+            profit_summary_display[col] = profit_summary_display[col].round(2)
+            profit_format_map[col] = "{:.2f}"
+    
+    # 创建样式器
+    profit_styler = profit_summary_display.style
+    
+    # 获取列名
+    profit_cols = profit_summary_display.columns.tolist()
+    
+    # 找到各部分的起始列
+    profit_profit_cols_start = profit_cols.index("推荐条数") if "推荐条数" in profit_cols else len(profit_cols)
+    profit_diff_cols_start = profit_cols.index("较利润优先满订条数差") if "较利润优先满订条数差" in profit_cols else len(profit_cols)
+    
+    # 设置样式
+    for col in profit_cols:
+        col_idx = profit_cols.index(col)
+        if col_idx >= profit_profit_cols_start and col_idx < profit_diff_cols_start:
+            # 推荐部分使用浅绿色
+            profit_styler = profit_styler.set_properties(subset=[col], **{'background-color': '#d4edda'})
+        elif col_idx >= profit_diff_cols_start:
+            # 对比部分使用浅青色
+            profit_styler = profit_styler.set_properties(subset=[col], **{'background-color': '#d1ecf1'})
+        else:
+            # 满订部分使用浅白色
+            profit_styler = profit_styler.set_properties(subset=[col], **{'background-color': '#ffffff'})
+    
+    # 设置表头样式
+    profit_styler = profit_styler.set_table_styles([
+        {'selector': 'th', 'props': [('background-color', '#f8f9fa'), ('font-weight', 'bold')]},
+    ])
+    
+    # 格式化数值列
+    profit_styler = profit_styler.format(profit_format_map, na_rep="None")
+    
     st.dataframe(
-        profit_recommendation_summary[
-            [
-                "档位",
-                "对比下一档",
-                "推荐条数",
-                "推荐金额",
-                "推荐盈亏",
-                "利润优先满订条数",
-                "利润优先满订盈亏",
-                "较利润优先满订条数差",
-                "较利润优先满订盈亏差",
-                "较下一档最贵满订多条数",
-                "较下一档最贵满订多金额",
-            ]
-        ],
+        profit_styler,
         use_container_width=True,
         hide_index=True,
     )
@@ -608,157 +820,118 @@ st.subheader("7. 各档位升档打满订单分析")
 if not has_strategy:
     st.info("未上传投放表，已跳过升档打满订单分析。")
 else:
-    # 合并dual_summary和profit_recommendation_summary
     if not dual_summary.empty and not profit_recommendation_summary.empty:
-        # 合并两个表格
         merged_summary = dual_summary.merge(
             profit_recommendation_summary,
             on="档位",
             how="outer",
             suffixes=("_满订", "_推荐")
         )
-        
-        # 选择需要的列并重新排列
-        display_columns = [
-            "档位",
-            "最贵满订条数",
-            "最贵满订金额",
-            "最贵满订盈亏",
-            "利润优先满订条数",
-            "利润优先满订盈亏",
-            "推荐条数",
-            "推荐金额",
-            "推荐盈亏",
-            "较利润优先满订条数差",
-            "较利润优先满订盈亏差",
-            "较下一档最贵满订多条数",
-            "较下一档最贵满订多金额"
-        ]
-        
-        # 只保留存在的列
-        existing_columns = [col for col in display_columns if col in merged_summary.columns]
-        final_summary = merged_summary[existing_columns].copy()
-        
-        # 按三十档然后递减排列
+
+        def merged_column(name: str) -> pd.Series:
+            for candidate in [f"{name}_满订", name, f"{name}_推荐"]:
+                if candidate in merged_summary.columns:
+                    return merged_summary[candidate]
+            return pd.Series(pd.NA, index=merged_summary.index)
+
+        final_summary = pd.DataFrame(
+            {
+                "档位": merged_summary["档位"],
+                "最贵满订条数": merged_column("最贵满订条数"),
+                "最贵满订金额": merged_column("最贵满订金额"),
+                "最贵满订盈亏": merged_column("最贵满订盈亏"),
+                "利润优先满订金额": merged_column("利润优先满订金额"),
+                "利润优先满订盈亏": merged_column("利润优先满订盈亏"),
+                "推荐条数": merged_column("推荐条数"),
+                "推荐金额": merged_column("推荐金额"),
+                "推荐盈亏": merged_column("推荐盈亏"),
+            }
+        )
         final_summary["档位序号"] = final_summary["档位"].apply(lambda x: TIER_COLUMNS.index(x) if x in TIER_COLUMNS else 999)
         final_summary = final_summary.sort_values("档位序号", ascending=True).drop(columns=["档位序号"])
-        
-        # 重命名列以匹配示例
-        column_renames = {
-            "最贵满订条数": "最贵满订条数",
-            "最贵满订金额": "最贵满订金额",
-            "最贵满订盈亏": "最贵满订盈亏",
-            "利润优先满订条数": "利润优先满订条数",
-            "利润优先满订盈亏": "利润优先满订盈亏",
-            "推荐条数": "推荐条数",
-            "推荐金额": "推荐金额",
-            "推荐盈亏": "推荐盈亏",
-            "较利润优先满订条数差": "较利润优先满订条数差",
-            "较利润优先满订盈亏差": "较利润优先满订盈亏差",
-            "较下一档最贵满订多条数": "较下一档最贵满订多条数",
-            "较下一档最贵满订多金额": "较下一档最贵满订多金额"
-        }
-        
-        final_summary = final_summary.rename(columns=column_renames)
-        
-        # 使用Styler添加不同的底色
-        def highlight_sections(val):
-            if isinstance(val, str):
-                return ""
-            return ""
-        
-        # 创建样式器
+
+        numeric_columns = [col for col in final_summary.columns if col != "档位"]
+        for col in numeric_columns:
+            final_summary[col] = pd.to_numeric(final_summary[col], errors="coerce")
+            final_summary[col] = final_summary[col].mask(final_summary[col].abs() < 0.005, 0)
+
+        final_summary.columns = pd.MultiIndex.from_tuples(
+            [
+                ("", "档位"),
+                ("升档", "最贵满订条数"),
+                ("升档", "最贵满订金额"),
+                ("升档", "最贵满订盈亏"),
+                ("满订", "利润优先满订金额"),
+                ("满订", "利润优先满订盈亏"),
+                ("保档", "推荐条数"),
+                ("保档", "推荐金额"),
+                ("保档", "推荐盈亏"),
+            ]
+        )
+
         styler = final_summary.style
-        
-        # 为不同部分设置不同的底色
-        # 满订部分使用浅白色背景
-        # 推荐部分使用浅绿色背景
-        # 对比部分使用浅青色背景
-        
-        # 先获取列名
-        cols = final_summary.columns.tolist()
-        
-        # 找到各部分的起始列
-        profit_cols_start = cols.index("推荐条数") if "推荐条数" in cols else len(cols)
-        diff_cols_start = cols.index("较利润优先满订条数差") if "较利润优先满订条数差" in cols else len(cols)
-        
-        # 设置样式
-        for col in cols:
-            col_idx = cols.index(col)
-            if col_idx >= profit_cols_start and col_idx < diff_cols_start:
-                # 推荐部分使用浅绿色
-                styler = styler.set_properties(subset=[col], **{'background-color': '#d4edda'})
-            elif col_idx >= diff_cols_start:
-                # 对比部分使用浅青色
-                styler = styler.set_properties(subset=[col], **{'background-color': '#d1ecf1'})
-            else:
-                # 满订部分使用浅白色
-                styler = styler.set_properties(subset=[col], **{'background-color': '#ffffff'})
-        
-        # 设置表头样式
+        upgrade_columns = [("升档", "最贵满订条数"), ("升档", "最贵满订金额"), ("升档", "最贵满订盈亏")]
+        full_columns = [("满订", "利润优先满订金额"), ("满订", "利润优先满订盈亏")]
+        keep_columns = [("保档", "推荐条数"), ("保档", "推荐金额"), ("保档", "推荐盈亏")]
+
+        def style_summary_cells(values: pd.DataFrame) -> pd.DataFrame:
+            styles = pd.DataFrame("", index=values.index, columns=values.columns)
+            for col in upgrade_columns:
+                if col in values.columns:
+                    styles[col] = "background-color: #ffffff"
+            for col in full_columns:
+                if col in values.columns:
+                    styles[col] = "background-color: #dcebf7"
+            for col in keep_columns:
+                if col in values.columns:
+                    styles[col] = "background-color: #c6efce"
+            loss_col = ("升档", "最贵满订盈亏")
+            if loss_col in values.columns:
+                styles.loc[values[loss_col] < 0, loss_col] += "; color: red; font-weight: 700"
+            for bold_col in [("满订", "利润优先满订盈亏"), ("保档", "推荐盈亏")]:
+                if bold_col in values.columns:
+                    styles.loc[values[bold_col].notna(), bold_col] += "; font-weight: 700"
+            return styles
+
+        styler = styler.apply(style_summary_cells, axis=None)
+
         styler = styler.set_table_styles([
-            {'selector': 'th', 'props': [('background-color', '#f8f9fa'), ('font-weight', 'bold')]},
+            {"selector": "th", "props": [("background-color", "#f8f9fa"), ("font-weight", "bold"), ("text-align", "center"), ("border", "1px solid #111")]},
+            {"selector": "td", "props": [("border", "1px solid #111"), ("text-align", "right")]},
         ])
-        
-        # 格式化数值列
-        numeric_cols = [col for col in final_summary.columns if col not in ["档位"]]
-        for col in numeric_cols:
-            if "条数" in col:
-                styler = styler.format({col: '{:.0f}'})
-            elif "金额" in col or "盈亏" in col or "差" in col:
-                styler = styler.format({col: '{:.2f}'})
-        
+
+        styler = styler.format(
+            {
+                ("升档", "最贵满订条数"): "{:.0f}",
+                ("升档", "最贵满订金额"): "{:.2f}",
+                ("升档", "最贵满订盈亏"): "{:.2f}",
+                ("满订", "利润优先满订金额"): "{:.2f}",
+                ("满订", "利润优先满订盈亏"): "{:.2f}",
+                ("保档", "推荐条数"): "{:.0f}",
+                ("保档", "推荐金额"): "{:.2f}",
+                ("保档", "推荐盈亏"): "{:.2f}",
+            },
+            na_rep="",
+        )
+
         st.dataframe(styler, use_container_width=True, hide_index=True)
+        
+        # 导出为Excel
+        output = BytesIO()
+        final_summary.to_excel(output, index=False, sheet_name='升档打满订单分析')
+        output.seek(0)
+        st.download_button(
+            label="导出为Excel",
+            data=output,
+            file_name='各档位升档打满订单分析.xlsx',
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            use_container_width=True,
+        )
+    else:
+        st.info("当前没有可展示的升档、满订、保档汇总。")
 
 st.divider()
-st.subheader("8. 库存估值与盈亏")
-
-if inventory_file is None:
-    st.info("上传库存表后，这里会按库存量而不是订单量做估值与盈亏。")
-else:
-    inv_cols = st.columns(4)
-    inv_cols[0].metric("库存条数", integer(int(inventory_profit["库存量"].sum()) if not inventory_profit.empty else 0))
-    inv_cols[1].metric("库存成本", money(float(inventory_profit["库存成本"].sum()) if not inventory_profit.empty else 0))
-    inv_cols[2].metric("库存市值", money(float(inventory_profit["库存市值"].sum()) if not inventory_profit.empty else 0))
-    inv_cols[3].metric("库存盈亏", money(float(inventory_profit["库存盈亏"].sum()) if not inventory_profit.empty else 0))
-    st.dataframe(
-        inventory_profit[["商品名称", "库存量", "批发价", "当期找货价格", "库存成本", "库存市值", "库存盈亏"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    if not missing_market_prices.empty:
-        st.markdown("**以下库存商品缺少行情价格，请补录后保存到行情价格库**")
-        editable = missing_market_prices.copy()
-        editable = editable[editable["商品名称"].astype(str).str.strip().ne("合计")].copy()
-        editable["当期找货价格"] = editable["当期找货价格"].astype("float64")
-        if editable.empty:
-            st.info("缺少行情价格的库存商品里只有“合计”行，已自动排除。")
-        else:
-            with st.form("missing_market_prices_form"):
-                edited = st.data_editor(
-                    editable,
-                    use_container_width=True,
-                    hide_index=True,
-                    key="missing_market_prices_editor",
-                )
-                save_manual_prices = st.form_submit_button("保存补录行情价格", type="primary")
-            if save_manual_prices:
-                manual = edited.copy()
-                manual = manual[manual["商品名称"].astype(str).str.strip().ne("合计")].copy()
-                manual = manual[manual["当期找货价格"].notna()].copy()
-                if manual.empty:
-                    st.warning("还没有填写可保存的行情价格。")
-                else:
-                    manual["批发价"] = pd.to_numeric(manual.get("批发价"), errors="coerce")
-                    manual["建议零售价"] = pd.to_numeric(manual.get("建议零售价"), errors="coerce")
-                    updated_db = upsert_manual_market_prices(db_prices, manual)
-                    save_price_db(updated_db)
-                    st.success("行情价格已成功保存到数据库！")
-                    st.rerun()
-
-st.divider()
-st.subheader("9. 本期投放规则展示")
+st.subheader("8. 本期投放规则展示")
 
 if not has_strategy:
     st.info("未上传投放表，已跳过投放规则展示。")
@@ -829,27 +1002,3 @@ else:
             all_tiers_detail = all_tiers_detail[mask].copy()
         
         st.dataframe(all_tiers_detail, use_container_width=True, hide_index=True)
-
-st.divider()
-st.subheader("导出当前行情价")
-if not db_prices.empty:
-    # 创建下载按钮
-    from io import BytesIO
-    
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        db_prices.to_excel(writer, index=False, sheet_name='行情价格')
-    output.seek(0)
-    
-    st.download_button(
-        label="下载行情价格表",
-        data=output,
-        file_name="行情价格表.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary"
-    )
-    
-    st.info(f"当前共有 {len(db_prices)} 条行情价格数据")
-else:
-    st.info("暂无行情价格数据")
