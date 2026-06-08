@@ -27,7 +27,7 @@ from tobacco_core.analysis import (
     parse_strategy,
     recommend_profit_plan,
 )
-from tobacco_core.price_store import load_price_db, merge_order_products, merge_uploaded_prices, save_price_db, upsert_manual_market_prices
+
 
 
 LAST_ANALYSIS_STATE_PATH = Path(__file__).resolve().parent / "data" / "last_analysis_state.pkl"
@@ -209,8 +209,6 @@ load_last_analysis_state()
 
 st.title("梦回唐朝图文店")
 
-db_prices = load_price_db()
-
 st.subheader("1. 上传分析文件")
 col1, col2 = st.columns(2)
 with col1:
@@ -316,9 +314,9 @@ use_cached_analysis_results = not calculation_requested and cached_analysis_resu
 
 uploaded_prices = fetch_market_prices_from_api()
 if not uploaded_prices.empty:
-    db_prices = merge_uploaded_prices(db_prices, uploaded_prices)
-    save_price_db(db_prices)
-    st.success(f"已从 API 更新行情价格库，本次写入 {len(uploaded_prices)} 条价格记录。")
+    st.success(f"已从 API 获取 {len(uploaded_prices)} 条行情价格。")
+else:
+    st.warning("未能从 API 获取行情价格，部分价格字段可能为空。")
 
 if use_cached_analysis_results:
     parsed = cached_analysis_results["parsed"]
@@ -330,7 +328,7 @@ if use_cached_analysis_results:
     
     parsed = ParsedWorkbook(
         orders=parsed.orders,
-        prices=db_prices.copy(),
+        prices=uploaded_prices.copy() if not uploaded_prices.empty else pd.DataFrame(),
         strategy_items=parsed.strategy_items,
         segment_limits=parsed.segment_limits,
         tier_totals=parsed.tier_totals,
@@ -342,18 +340,18 @@ if use_cached_analysis_results:
         try:
             if not has_strategy:
                 order_analysis_data = parsed.orders.copy()
-                if "商品名称" in order_analysis_data.columns and "商品名称" in db_prices.columns:
+                if not uploaded_prices.empty and "商品名称" in order_analysis_data.columns and "商品名称" in uploaded_prices.columns:
                     price_cols = ["商品名称", "批发价", "建议零售价", "当期找货价格"]
-                    existing_price_cols = [col for col in price_cols if col in db_prices.columns]
+                    existing_price_cols = [col for col in price_cols if col in uploaded_prices.columns]
                     order_analysis_data = order_analysis_data.merge(
-                        db_prices[existing_price_cols],
+                        uploaded_prices[existing_price_cols],
                         on="商品名称",
                         how="left",
                         suffixes=("", "_price")
                     )
                     if "批发价_price" in order_analysis_data.columns:
                         order_analysis_data["批发价"] = order_analysis_data["批发价_price"].fillna(order_analysis_data.get("批发价"))
-                    # 当期找货价格总是使用价格库的最新值（来自API）
+                    # 当期找货价格总是使用API获取的最新值
                     if "当期找货价格_price" in order_analysis_data.columns:
                         order_analysis_data["当期找货价格"] = order_analysis_data["当期找货价格_price"]
                 if "价位段" not in order_analysis_data.columns:
@@ -377,7 +375,7 @@ if use_cached_analysis_results:
                 order_profit = temp
     
     if has_order:
-        order_price_check = build_order_price_check_dataset(parsed.orders, db_prices)
+        order_price_check = build_order_price_check_dataset(parsed.orders, uploaded_prices if not uploaded_prices.empty else pd.DataFrame())
         missing_order_market_prices = compute_missing_order_market_prices(order_price_check)
     else:
         missing_order_market_prices = pd.DataFrame()
@@ -400,8 +398,8 @@ if use_cached_analysis_results:
         profit_recommendation_summary = compute_profit_recommendation_summary(analysis_data, parsed.segment_limits, parsed.tier_totals)
 else:
 
-    if db_prices.empty:
-        st.error("当前行情价格库为空，无法引用历史批发价，请检查本地 API 服务是否正常运行。")
+    if uploaded_prices.empty:
+        st.error("未能从 API 获取行情价格，无法进行价格计算，请检查本地 API 服务是否正常运行。")
         st.stop()
 
     try:
@@ -420,13 +418,11 @@ else:
             orders = empty_order
         else:
             orders = parse_orders(order_file)
-            db_prices = merge_order_products(db_prices, orders)
-            save_price_db(db_prices)
     
         # 创建parsed对象
         parsed = ParsedWorkbook(
             orders=orders,
-            prices=db_prices.copy(),
+            prices=uploaded_prices.copy(),
             strategy_items=strategy_items,
             segment_limits=segment_limits,
             tier_totals=tier_totals,
@@ -451,19 +447,19 @@ else:
                 # 如果没有投放表，直接用订单表和价格表构建数据
                 order_analysis_data = parsed.orders.copy()
                 # 合并价格信息
-                if "商品名称" in order_analysis_data.columns and "商品名称" in db_prices.columns:
+                if "商品名称" in order_analysis_data.columns and "商品名称" in uploaded_prices.columns:
                     price_cols = ["商品名称", "批发价", "建议零售价", "当期找货价格"]
-                    existing_price_cols = [col for col in price_cols if col in db_prices.columns]
+                    existing_price_cols = [col for col in price_cols if col in uploaded_prices.columns]
                     order_analysis_data = order_analysis_data.merge(
-                        db_prices[existing_price_cols],
+                        uploaded_prices[existing_price_cols],
                         on="商品名称",
                         how="left",
                         suffixes=("", "_price")
                     )
-                    # 使用价格库的批发价
+                    # 使用API获取的批发价
                     if "批发价_price" in order_analysis_data.columns:
                         order_analysis_data["批发价"] = order_analysis_data["批发价_price"].fillna(order_analysis_data.get("批发价"))
-                    # 当期找货价格总是使用价格库的最新值（来自API）
+                    # 当期找货价格总是使用API获取的最新值
                     if "当期找货价格_price" in order_analysis_data.columns:
                         order_analysis_data["当期找货价格"] = order_analysis_data["当期找货价格_price"]
             
@@ -493,7 +489,7 @@ else:
                 order_profit = temp
 
     if has_order:
-        order_price_check = build_order_price_check_dataset(parsed.orders, db_prices)
+        order_price_check = build_order_price_check_dataset(parsed.orders, uploaded_prices if not uploaded_prices.empty else pd.DataFrame())
         missing_order_market_prices = compute_missing_order_market_prices(order_price_check)
 
     order_total_qty = int(order_profit["订单量"].sum()) if not order_profit.empty and "订单量" in order_profit.columns else 0
@@ -538,7 +534,6 @@ else:
         compare_cost_plan=compare_cost_plan,
         dual_summary=dual_summary,
         profit_recommendation_summary=profit_recommendation_summary,
-        db_prices=db_prices,
     )
 
 st.subheader("识别结果")
@@ -618,26 +613,12 @@ else:
         if order_editable.empty:
             st.info("缺少行情价格的订单商品里只有“合计”行，已自动排除。")
         else:
-            with st.form("missing_order_market_prices_form"):
-                order_edited = st.data_editor(
-                    order_editable,
-                    use_container_width=True,
-                    hide_index=True,
-                    key="missing_order_market_prices_editor",
-                )
-                save_order_prices = st.form_submit_button("保存订单缺失行情价格", type="primary")
-            if save_order_prices:
-                manual = order_edited.copy()
-                manual = manual[manual["商品名称"].astype(str).str.strip().ne("合计")].copy()
-                manual = manual[manual["当期找货价格"].notna()].copy()
-                if manual.empty:
-                    st.warning("还没有填写可保存的订单行情价格。")
-                else:
-                    manual["批发价"] = pd.to_numeric(manual.get("批发价"), errors="coerce")
-                    manual["建议零售价"] = pd.to_numeric(manual.get("建议零售价"), errors="coerce")
-                    updated_db = upsert_manual_market_prices(db_prices, manual)
-                    save_price_db(updated_db)
-                    st.success(f"已把 {len(manual)} 条订单商品行情价格写入价格库。刷新后会按新价格重新计算。")
+            st.data_editor(
+                order_editable,
+                use_container_width=True,
+                hide_index=True,
+                disabled=True,
+            )
 
 st.divider()
 st.subheader("4. 本期档位最高满订汇总")
