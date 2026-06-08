@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -17,7 +17,7 @@ class RuleModule:
     steps: tuple[str, ...]
     formulas: tuple[RuleFormula, ...]
     outputs: tuple[str, ...]
-    notes: tuple[str, ...] = ()
+    notes: tuple[str, ...] =()
 
 
 RULE_MODULES = (
@@ -27,7 +27,7 @@ RULE_MODULES = (
         purpose="从本地 API 获取当前行情价格，并统一转换成分析使用的价格口径。",
         inputs=("product_name", "product_code", "suggested_price", "price", "market_price"),
         steps=(
-            "固定调用 http://localhost:9527/api/market-price/all，接口返回对象时读取 data 数组。",
+            "固定调用 http://localhost:30000/api/market-price/all，接口返回对象时读取 data 数组。",
             "product_name 映射为商品名称，product_code 映射为条码，suggested_price 映射为建议零售价。",
             "price 只映射为批发价/进货价，不能作为行情价使用。",
             "market_price 只映射为当期找货价格/行情价，后续利润和估值优先使用该字段。",

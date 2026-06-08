@@ -53,11 +53,33 @@ def merge_uploaded_prices(existing: pd.DataFrame, uploaded: pd.DataFrame) -> pd.
             base[column] = pd.NA
         if column not in incoming.columns:
             incoming[column] = pd.NA
-    merged = pd.concat([base[DB_COLUMNS], incoming[DB_COLUMNS]], ignore_index=True)
-    merged["_key"] = merged.apply(build_key, axis=1)
-    merged = merged.drop_duplicates(subset="_key", keep="last").drop(columns="_key")
-    merged = merged.sort_values("商品名称").reset_index(drop=True)
-    return merged
+    
+    base["当期找货价格"] = pd.NA
+    
+    base["_key"] = base.apply(build_key, axis=1)
+    incoming["_key"] = incoming.apply(build_key, axis=1)
+    
+    for _, row in incoming.iterrows():
+        key = row["_key"]
+        market_price = row["当期找货价格"]
+        
+        mask = base["_key"] == key
+        if mask.any():
+            base.loc[mask, "当期找货价格"] = market_price
+        else:
+            product_name = str(row.get("商品名称", "")).strip()
+            if product_name:
+                name_mask = base["商品名称"].str.strip() == product_name
+                if name_mask.any():
+                    base.loc[name_mask, "当期找货价格"] = market_price
+                else:
+                    base = pd.concat([base, incoming.loc[[_]]], ignore_index=True)
+            else:
+                base = pd.concat([base, incoming.loc[[_]]], ignore_index=True)
+    
+    base = base.drop(columns="_key")
+    base = base.sort_values("商品名称").reset_index(drop=True)
+    return base
 
 
 def upsert_manual_market_prices(existing: pd.DataFrame, manual: pd.DataFrame) -> pd.DataFrame:

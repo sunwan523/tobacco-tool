@@ -349,25 +349,16 @@ def enrich_with_price_lookup(items: pd.DataFrame, prices: pd.DataFrame) -> pd.Da
     lookup = prices[price_cols].copy()
 
     if "商品名称" in result.columns:
-        name_map = lookup.dropna(subset=["商品名称"]).drop_duplicates(subset=["商品名称"], keep="last").set_index("商品名称")
-        apply_lookup_map(result, name_map, "商品名称")
-
-    if "条码" in result.columns and "条码" in lookup.columns:
-        barcode_map = lookup[lookup["条码"].notna() & (lookup["条码"].astype(str).str.strip() != "")]
-        barcode_map = barcode_map.drop_duplicates(subset=["条码"], keep="last").set_index("条码")
-        apply_lookup_map(result, barcode_map, "条码")
-
-    if "盒码" in result.columns and "盒码" in lookup.columns:
-        box_map = lookup[lookup["盒码"].notna() & (lookup["盒码"].astype(str).str.strip() != "")]
-        box_map = box_map.drop_duplicates(subset=["盒码"], keep="last").set_index("盒码")
-        apply_lookup_map(result, box_map, "盒码")
+        sorted_lookup = lookup.dropna(subset=["商品名称"]).sort_values(by=["商品名称", "当期找货价格"], ascending=[True, False])
+        name_map = sorted_lookup.drop_duplicates(subset=["商品名称"], keep="first").set_index("商品名称")
+        apply_lookup_map(result, name_map, "商品名称", overwrite_market_price=True)
 
     if "批发价" in result.columns and "价格库批发价" not in result.columns:
         result = result.rename(columns={"批发价": "价格库批发价"})
     return result
 
 
-def apply_lookup_map(result: pd.DataFrame, lookup_map: pd.DataFrame, key_col: str) -> None:
+def apply_lookup_map(result: pd.DataFrame, lookup_map: pd.DataFrame, key_col: str, overwrite_market_price: bool = False) -> None:
     for source_col in ["建议零售价", "批发价", "当期找货价格", "盒码", "条码"]:
         if source_col not in lookup_map.columns:
             continue
@@ -375,7 +366,10 @@ def apply_lookup_map(result: pd.DataFrame, lookup_map: pd.DataFrame, key_col: st
         if source_col not in result.columns:
             result[source_col] = mapped
         else:
-            result[source_col] = result[source_col].where(~result[source_col].isna() & (result[source_col].astype(str) != ""), mapped)
+            if source_col == "当期找货价格" and overwrite_market_price:
+                result[source_col] = mapped
+            else:
+                result[source_col] = result[source_col].where(~result[source_col].isna() & (result[source_col].astype(str) != ""), mapped)
 
 
 def infer_current_tier(order_total_qty: int, tier_totals: pd.DataFrame) -> tuple[str, str]:

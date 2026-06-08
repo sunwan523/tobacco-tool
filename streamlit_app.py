@@ -224,7 +224,7 @@ has_pending_upload = strategy_changed or order_changed
 
 def fetch_market_prices_from_api() -> pd.DataFrame:
     try:
-        response = requests.get("http://localhost:9527/api/market-price/all", timeout=10)
+        response = requests.get("http://localhost:30000/api/market-price/all", timeout=10)
         response.raise_for_status()
         data = response.json()
 
@@ -314,32 +314,91 @@ order_file = get_analysis_file("order", use_pending_files)
 cached_analysis_results = st.session_state.get("cached_analysis_results")
 use_cached_analysis_results = not calculation_requested and cached_analysis_results is not None
 
+uploaded_prices = fetch_market_prices_from_api()
+if not uploaded_prices.empty:
+    db_prices = merge_uploaded_prices(db_prices, uploaded_prices)
+    save_price_db(db_prices)
+    st.success(f"已从 API 更新行情价格库，本次写入 {len(uploaded_prices)} 条价格记录。")
+
 if use_cached_analysis_results:
     parsed = cached_analysis_results["parsed"]
-    analysis_data = cached_analysis_results["analysis_data"]
-    missing_order_market_prices = cached_analysis_results["missing_order_market_prices"]
     has_order = cached_analysis_results["has_order"]
     has_strategy = cached_analysis_results["has_strategy"]
-    order_profit = cached_analysis_results["order_profit"]
-    order_total_qty = cached_analysis_results["order_total_qty"]
-    order_total_cost = cached_analysis_results["order_total_cost"]
-    order_total_profit = cached_analysis_results["order_total_profit"]
     current_tier = cached_analysis_results["current_tier"]
     tier_reason = cached_analysis_results["tier_reason"]
     compare_tier = cached_analysis_results["compare_tier"]
-    current_cost_plan = cached_analysis_results["current_cost_plan"]
-    current_profit_plan = cached_analysis_results["current_profit_plan"]
-    compare_cost_plan = cached_analysis_results["compare_cost_plan"]
-    dual_summary = cached_analysis_results["dual_summary"]
-    profit_recommendation_summary = cached_analysis_results["profit_recommendation_summary"]
-    db_prices = cached_analysis_results["db_prices"]
+    
+    parsed = ParsedWorkbook(
+        orders=parsed.orders,
+        prices=db_prices.copy(),
+        strategy_items=parsed.strategy_items,
+        segment_limits=parsed.segment_limits,
+        tier_totals=parsed.tier_totals,
+    )
+    analysis_data = build_analysis_dataset(parsed)
+    
+    order_profit = pd.DataFrame()
+    if has_order:
+        try:
+            if not has_strategy:
+                order_analysis_data = parsed.orders.copy()
+                if "商品名称" in order_analysis_data.columns and "商品名称" in db_prices.columns:
+                    price_cols = ["商品名称", "批发价", "建议零售价", "当期找货价格"]
+                    existing_price_cols = [col for col in price_cols if col in db_prices.columns]
+                    order_analysis_data = order_analysis_data.merge(
+                        db_prices[existing_price_cols],
+                        on="商品名称",
+                        how="left",
+                        suffixes=("", "_price")
+                    )
+                    if "批发价_price" in order_analysis_data.columns:
+                        order_analysis_data["批发价"] = order_analysis_data["批发价_price"].fillna(order_analysis_data.get("批发价"))
+                    # 当期找货价格总是使用价格库的最新值（来自API）
+                    if "当期找货价格_price" in order_analysis_data.columns:
+                        order_analysis_data["当期找货价格"] = order_analysis_data["当期找货价格_price"]
+                if "价位段" not in order_analysis_data.columns:
+                    order_analysis_data["价位段"] = ""
+                if "有效销售价" not in order_analysis_data.columns:
+                    order_analysis_data["有效销售价"] = order_analysis_data.get("当期找货价格", pd.Series()).fillna(order_analysis_data.get("批发价"))
+                if "单条毛利" not in order_analysis_data.columns:
+                    order_analysis_data["单条毛利"] = order_analysis_data["有效销售价"] - order_analysis_data["批发价"]
+                temp_order_profit = order_analysis_data[order_analysis_data["订单量"] > 0].copy()
+                temp_order_profit["订单成本"] = temp_order_profit["订单量"] * temp_order_profit["批发价"]
+                temp_order_profit["订单估值"] = temp_order_profit["订单量"] * temp_order_profit["有效销售价"]
+                temp_order_profit["订单盈亏"] = temp_order_profit["订单量"] * temp_order_profit["单条毛利"]
+                order_profit = temp_order_profit.sort_values(["订单盈亏", "订单成本"], ascending=[False, False]).reset_index(drop=True)
+            else:
+                order_profit = compute_order_profit(analysis_data)
+        except Exception as e:
+            st.warning(f"计算订单盈亏时出错：{e}，将使用简化方法计算")
+            if "订单量" in parsed.orders.columns and "批发价" in parsed.orders.columns:
+                temp = parsed.orders[parsed.orders["订单量"] > 0].copy()
+                temp["订单成本"] = temp["订单量"] * temp["批发价"]
+                order_profit = temp
+    
+    if has_order:
+        order_price_check = build_order_price_check_dataset(parsed.orders, db_prices)
+        missing_order_market_prices = compute_missing_order_market_prices(order_price_check)
+    else:
+        missing_order_market_prices = pd.DataFrame()
+    
+    order_total_qty = int(order_profit["订单量"].sum()) if not order_profit.empty and "订单量" in order_profit.columns else 0
+    order_total_cost = float(order_profit["订单成本"].sum()) if not order_profit.empty and "订单成本" in order_profit.columns else 0.0
+    order_total_profit = float(order_profit["订单盈亏"].sum()) if not order_profit.empty and "订单盈亏" in order_profit.columns else 0.0
+    
+    current_cost_plan = None
+    current_profit_plan = None
+    compare_cost_plan = None
+    dual_summary = pd.DataFrame()
+    profit_recommendation_summary = pd.DataFrame()
+    
+    if has_strategy:
+        current_cost_plan = compute_tier_plan(analysis_data, parsed.segment_limits, current_tier, "cost", get_tier_total_qty(parsed.tier_totals, current_tier))
+        current_profit_plan = compute_tier_plan(analysis_data, parsed.segment_limits, current_tier, "profit", get_tier_total_qty(parsed.tier_totals, current_tier))
+        compare_cost_plan = compute_tier_plan(analysis_data, parsed.segment_limits, compare_tier, "cost", get_tier_total_qty(parsed.tier_totals, compare_tier)) if compare_tier else None
+        dual_summary = compute_dual_strategy_summary(analysis_data, parsed.segment_limits, parsed.tier_totals)
+        profit_recommendation_summary = compute_profit_recommendation_summary(analysis_data, parsed.segment_limits, parsed.tier_totals)
 else:
-    if calculation_requested:
-        uploaded_prices = fetch_market_prices_from_api()
-        if not uploaded_prices.empty:
-            db_prices = merge_uploaded_prices(db_prices, uploaded_prices)
-            save_price_db(db_prices)
-            st.success(f"已从 API 更新行情价格库，本次写入 {len(uploaded_prices)} 条价格记录。")
 
     if db_prices.empty:
         st.error("当前行情价格库为空，无法引用历史批发价，请检查本地 API 服务是否正常运行。")
@@ -404,9 +463,9 @@ else:
                     # 使用价格库的批发价
                     if "批发价_price" in order_analysis_data.columns:
                         order_analysis_data["批发价"] = order_analysis_data["批发价_price"].fillna(order_analysis_data.get("批发价"))
-                    # 使用价格库的当期找货价格
+                    # 当期找货价格总是使用价格库的最新值（来自API）
                     if "当期找货价格_price" in order_analysis_data.columns:
-                        order_analysis_data["当期找货价格"] = order_analysis_data["当期找货价格_price"].fillna(order_analysis_data.get("当期找货价格"))
+                        order_analysis_data["当期找货价格"] = order_analysis_data["当期找货价格_price"]
             
                 # 确保有必要的列
                 if "价位段" not in order_analysis_data.columns:
@@ -918,7 +977,9 @@ else:
         
         # 导出为Excel
         output = BytesIO()
-        final_summary.to_excel(output, index=False, sheet_name='升档打满订单分析')
+        export_df = final_summary.copy()
+        export_df.columns = ['-'.join(col).strip('-') for col in export_df.columns]
+        export_df.to_excel(output, index=False, sheet_name='升档打满订单分析')
         output.seek(0)
         st.download_button(
             label="导出为Excel",
