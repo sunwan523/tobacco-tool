@@ -15,6 +15,9 @@ ENV/
 data/*.pkl
 data/*.csv
 data/*.xlsx
+data/*.db
+data/auto_sync_boot.json
+历史投入表/
 logs/
 .streamlit/secrets.toml
 .vscode/

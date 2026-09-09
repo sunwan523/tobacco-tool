@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import pickle
+import time
 from io import BytesIO
 from pathlib import Path
-import pickle
 
 import pandas as pd
 import requests
@@ -27,6 +30,42 @@ from tobacco_core.analysis import (
     parse_strategy,
     recommend_profit_plan,
 )
+from tobacco_core import auto_sync as alloc_sync
+from tobacco_core.push_client import build_payload, extract_week_label, kucun_has_week, push_allocation
+
+
+def push_allocation_to_inventory(strategy_items, segment_limits, tier_totals, file_name: str | None, file_mtime=None) -> None:
+    """计算成功后把投放数据同步到库存系统（任何异常都不影响本页展示）。
+
+    与库存系统周次比对：该周已存在时不重复推送。
+    """
+    try:
+        week_label = extract_week_label(file_name)
+        if not week_label:
+            st.warning("无法从投放表文件名识别周标识（如“2026年9月第2周”），未同步投放数据。")
+            return
+        try:
+            present = kucun_has_week(week_label)
+        except Exception:
+            present = None
+        if present:
+            st.caption(f"ℹ️ {week_label} 已在库存系统中，跳过重复推送。")
+            return
+        mtime_iso = None
+        if file_mtime is not None:
+            try:
+                mtime_iso = file_mtime.isoformat()
+            except Exception:
+                mtime_iso = None
+        payload = build_payload(strategy_items, segment_limits, week_label, tier_totals, mtime_iso)
+        ok, message = push_allocation(payload)
+        if ok:
+            st.toast(message)
+            st.caption(f"✅ {message}")
+        else:
+            st.warning(f"投放数据{message}（不影响本次计算结果）")
+    except Exception as exc:
+        st.warning(f"投放数据同步出错（不影响本次计算结果）：{exc}")
 
 
 
@@ -209,6 +248,144 @@ load_last_analysis_state()
 
 st.title("梦回唐朝图文店")
 
+# ==================== 投放表自动同步（启动检查 / 手动按钮） ====================
+# 每个进程只自动扫描一次；之后靠页面上的“扫描新投放表并同步”按钮手动补扫。
+AUTO_PID_FILE = Path(__file__).resolve().parent / "data" / "auto_sync_boot.json"
+
+
+def _write_boot_marker() -> None:
+    try:
+        AUTO_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        AUTO_PID_FILE.write_text(json.dumps({"pid": os.getpid(), "ts": time.time()}), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _should_boot_scan() -> bool:
+    """服务/应用本次启动后是否还没扫描过（按进程 PID 判断）。"""
+    try:
+        data = json.loads(AUTO_PID_FILE.read_text(encoding="utf-8"))
+        return int(data.get("pid", -1)) != os.getpid()
+    except Exception:
+        return True
+
+
+def _active_week_label() -> str:
+    return extract_week_label(st.session_state.get("saved_strategy_name") or "") or ""
+
+
+def _join_weeks(items: list[str], limit: int = 4) -> str:
+    if not items:
+        return ""
+    shown = items[:limit]
+    tail = f" 等 {len(items) - limit} 个" if len(items) > limit else ""
+    return "、".join(shown) + tail
+
+
+def _render_sync_result(summary: dict, manual: bool) -> None:
+    if not summary:
+        return
+    base = f"扫描 {summary['scanned']} 个投放表，其中 {summary['skipped_existing']} 周此前已归档。"
+    parts = []
+    if summary["archived"]:
+        parts.append(f"新分析归档 {len(summary['archived'])} 周：" + _join_weeks(summary["archived"]))
+    if summary["pushed"]:
+        parts.append(f"已推送到库存系统 {len(summary['pushed'])} 周：" + _join_weeks(summary["pushed"]))
+    if summary["already_in_kucun"]:
+        parts.append(f"库存系统已存在 {len(summary['already_in_kucun'])} 周，跳过不重复推送")
+    if summary["pending"]:
+        parts.append("待推送：" + _join_weeks(summary["pending"]))
+    if summary["errors"]:
+        parts.append("解析失败：" + _join_weeks(summary["errors"]))
+    if parts or manual:
+        st.success(base + (("；" + "；".join(parts)) if parts else "没有发现新的周投放表。"))
+    if not summary["kucun_ok"]:
+        st.warning("未能连接库存系统：新周已分析并存档，但未推送；启动库存系统后再次点击“扫描新投放表并同步”即可补齐。")
+
+
+def _render_archive_section() -> None:
+    """投放档案库：按周查询核心投放结果与同步状态。"""
+    weeks = alloc_sync.list_weeks()
+    st.divider()
+    if not weeks:
+        st.caption("📚 投放档案库：本地暂无投放周记录（首次扫描「历史投入表」后会自动建立）。")
+        return
+    st.subheader("📚 投放档案库（按周查询核心投放结果）")
+    label_map = {w["week_label"]: w for w in weeks}
+    selected = st.selectbox("选择投放周", list(label_map.keys()), key="alloc_archive_week_select")
+    meta = label_map[selected]
+    status_icon = {
+        "pushed": "✅ 已推送",
+        "present": "🟢 库存已存在（未重复推送）",
+        "pending": "🟠 待推送",
+    }.get(meta["kucun_status"], "⚪ 未推送")
+    st.markdown(f"**{selected}**　·　{status_icon}")
+    st.caption(
+        f"来源文件：{meta['source_file']}　·　分析时间：{meta['analyzed_at'] or '—'}　·　"
+        f"同步信息：{meta['push_message'] or '—'}"
+    )
+    detail = alloc_sync.load_week(selected)
+    if not detail:
+        st.info("该周没有明细数据。")
+        return
+    totals = detail["tier_totals"]
+    items = detail["strategy_items"]
+    limits = detail["segment_limits"]
+    official = 0
+    if not totals.empty and "可订货量合计" in totals.columns:
+        official = int(pd.to_numeric(totals["可订货量合计"], errors="coerce").fillna(0).sum())
+    kpi = st.columns(3)
+    kpi[0].metric("官方可订货量合计", integer(official))
+    kpi[1].metric("投放商品行数", integer(len(items)))
+    kpi[2].metric("段位上限行数", integer(len(limits)))
+    with st.expander(f"查看 {selected} 的各档位合计与明细", expanded=False):
+        if not totals.empty:
+            st.markdown("**各档位可订货量合计**")
+            st.dataframe(totals, use_container_width=True, hide_index=True)
+        if not items.empty:
+            st.markdown("**投放明细（最多前 100 行）**")
+            st.dataframe(items.head(100), use_container_width=True, hide_index=True)
+
+
+_force_recompute = False
+manual_sync_clicked = st.button(
+    "📥 扫描新投放表并同步",
+    key="manual_alloc_sync",
+    use_container_width=True,
+    help="扫描「历史投入表」目录：分析未归档的新周投放表并存入本地档案库；与库存系统比对后只推送缺失周，不重复推送。",
+)
+if manual_sync_clicked or _should_boot_scan():
+    _boot_scan = not manual_sync_clicked
+    with st.spinner("正在扫描「历史投入表」并同步投放数据…"):
+        _sync_summary = alloc_sync.run_sync()
+    if _boot_scan:
+        _write_boot_marker()
+    _render_sync_result(_sync_summary, manual=manual_sync_clicked)
+    if _sync_summary and _sync_summary.get("kucun_ok") and (
+        _sync_summary["archived"] or _sync_summary["pushed"] or _sync_summary["already_in_kucun"]
+    ):
+        _target = _sync_summary.get("newest_processed")
+        # 打开页面直接展示最新分析的这一周（用户刚另传新文件时以用户选择为准，不覆盖）
+        if (
+            _target
+            and _target != _active_week_label()
+            and st.session_state.get("pending_strategy_file") is None
+        ):
+            _target_path = alloc_sync.path_for_week(_target)
+            if _target_path is not None:
+                try:
+                    _data = _target_path.read_bytes()
+                    st.session_state.saved_strategy_file = _data
+                    st.session_state.saved_strategy_name = _target_path.name
+                    st.session_state.saved_strategy_signature = file_signature(_target_path.name, _data)
+                    st.session_state.analysis_started = True
+                    st.session_state.cached_analysis_results = None
+                    _force_recompute = True
+                except Exception as exc:  # noqa: BLE001
+                    st.warning(f"无法载入最新周投放表用于展示：{exc}")
+_render_archive_section()
+st.markdown("---")
+
 st.subheader("1. 上传分析文件")
 col1, col2 = st.columns(2)
 with col1:
@@ -274,6 +451,10 @@ with col1:
     calculation_requested = st.button("开始计算", type="primary", use_container_width=True)
 with col2:
     clear_cache = st.button("清除数据", use_container_width=True)
+
+# 启动自动同步发现新的下一周投放表时，强制按该文件重新计算并直接展示
+if _force_recompute:
+    calculation_requested = True
 
 use_pending_files = calculation_requested and has_pending_upload
 
@@ -535,6 +716,15 @@ else:
         dual_summary=dual_summary,
         profit_recommendation_summary=profit_recommendation_summary,
     )
+    if calculation_requested and has_strategy and not parsed.strategy_items.empty:
+        saved_file = st.session_state.get("saved_strategy_file")
+        push_allocation_to_inventory(
+            parsed.strategy_items,
+            parsed.segment_limits,
+            parsed.tier_totals,
+            st.session_state.get("saved_strategy_name"),
+            getattr(saved_file, "last_modified", None) if saved_file is not None else None,
+        )
 
 st.subheader("识别结果")
 if has_order:
